@@ -2,6 +2,300 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.8.4 - 2026-07-28
+
+### Added
+
+- **`executeScript(String sql)` — runs a whole multi-statement script,
+  the only call in this library that executes more than one statement.**
+  `prepareQuery` + `DbasSqliteStatement.executeSql` do one
+  `sqlite3_prepare_v2`, one step and one finalize, and the C layer hands
+  the prepare a `nullptr` tail pointer, so everything after the first
+  `;` is discarded before SQLite ever sees it — with no rc, no exception
+  and no log. Measured through the shipped public API, a
+  `CREATE TABLE …; CREATE UNIQUE INDEX …; PRAGMA foreign_keys = ON;`
+  string returned `rc=0` and left `tables=1, indexes=0,
+  foreign_keys=0`. Splitting on `;` in Dart was rejected rather than
+  attempted: `sqlite3_complete` is not exported by the shipped binary,
+  so a correct splitter would need a hand-rolled lexer over quoted
+  literals, comments and `BEGIN … END` trigger bodies, and consumer
+  scripts carry `CHECK` bodies of arbitrary SQL. `executeScript`
+  instead exposes the path that was already correct and already wired
+  end to end but never public — `sqlite3_exec`, the same entry point
+  `beginTransaction` / `commit` / `rollback` / `vacuum` go through.
+
+  It documents the semantics it inherits rather than hiding them.
+  Result rows are **discarded** (a `SELECT` inside a script runs and
+  yields nothing — use `prepareQuery` + `executeReader` to read rows).
+  There are **no bindings**: `sqlite3_exec` has no bind surface, so the
+  text must be complete, parameterised SQL belongs on `prepareQuery`,
+  and untrusted values must never be interpolated into a script.
+  Execution **stops at the first statement that fails**, with every
+  statement before it already applied — and outside a transaction those
+  are already committed, so there is **no atomicity across the script**
+  unless the caller wraps it:
+  `await db.transaction((tx) => tx.executeScript(sql))`. The return
+  value is the connection's `sqlite3_changes64` read after the script,
+  so it is the count of the **last row-changing statement**, not a
+  total. Calling it inside a transaction is deliberately allowed
+  (`vacuum` / `checkpoint` reject there only because SQLite itself
+  refuses them): wrapping is the documented remedy for the
+  non-atomicity, so a guard would have left callers nothing but the
+  unsafe mode.
+
+- **`checkpoint()` — folds committed WAL frames into the main `.db`
+  file and reports exactly how far it got**, as a
+  `DbasSqliteCheckpointResult` (`busy`, `log`, `checkpointed`,
+  `isComplete`). Rarely needed now that every commit, `closeDb()` and
+  `streamCopyDb()` fold on their own; reach for it when you are about
+  to read, copy or ship the main `.db` file **by other means** and need
+  to know, not assume, that the data is in it.
+
+  **`busy` is not a success signal.** A PASSIVE checkpoint that folds
+  nothing because a reader pins the WAL still reports `busy: 0` and
+  `SQLITE_OK` — measured `(busy: 0, log: 10, checkpointed: 0)` — which
+  by that flag alone is indistinguishable from a full fold.
+  `isComplete` (`checkpointed == log`) is the only honest test; a
+  non-WAL database reports `log == checkpointed == -1`, which reads as
+  complete and correctly means "nothing was left behind". An incomplete
+  fold is not an error either: a reader holding a WAL snapshot pins
+  every frame above it, no checkpoint mode can fold those, and they
+  fold at the next opportunity. That is also why the blocking modes are
+  not offered — measured against this library, `TRUNCATE` waited out
+  the entire 5 s `busy_timeout` (5034 ms) under a pinned reader
+  snapshot and then folded exactly the frames PASSIVE folded in ~0 ms.
+
+- **`beginTransaction({bool strict = false})` — opt-in real
+  serialization.** The default (`strict: false`) is unchanged and still
+  idempotent: a call made while a transaction is already active does
+  nothing rather than taking a second hold on the writer lock. A
+  `strict: true` call never joins — it parks on the writer-lock FIFO
+  queue until the active transaction's `commit()` / `rollback()`
+  releases the lock, and only then issues its own `BEGIN TRANSACTION`,
+  so it always leaves `startedCurrentTransaction` as `true`.
+  Uncontended, the two modes behave identically. `strict: true` from
+  the flow that already owns the transaction is a self-deadlock by
+  construction — it parks, and the only thing that could wake it is a
+  `commit()` / `rollback()` that flow can no longer reach — so the
+  writer-lock wait is now bounded (see *Changed*) and such a call fails
+  with `DbasSqliteErrorCode.writerLockWaitTimeout` instead of hanging.
+  Treat that error as a bug in the calling code, not a transient.
+
+- **`startedCurrentTransaction`** — `true` when the most recent
+  `beginTransaction()` on this instance issued a real
+  `BEGIN TRANSACTION`, `false` when it took the idempotent join path.
+  Read it immediately after the `await`, before any other suspension.
+  It exists so a caller can tell whether ending the transaction is its
+  own job: `if (db.startedCurrentTransaction) await db.commit();` skips
+  the call entirely when you merely joined someone else's transaction.
+  There is no reference counting — a joiner's `commit()` ends the
+  transaction for everyone — so this is the supported way to avoid that
+  hazard.
+
+### Fixed
+
+- **Committed data could sit in the `-wal` indefinitely, so any read of
+  the main `.db` file alone silently missed it.** Nothing on the Dart
+  side issued a WAL pragma at open, so the native writer inherited
+  SQLite's stock `wal_autocheckpoint=1000` (the web worker issues `=1`
+  itself, so this was native-only), and `closeDb` performed no
+  checkpoint of its own on either path. What made the common case look
+  healthy was only SQLite's last-connection auto-checkpoint, which
+  disappears the moment anything else still has the database open.
+  Measured: 200 committed inserts left the main `.db` at 4096 bytes
+  with 832 KB sitting in the `-wal` and the table **absent** from a
+  copy of the main file alone — and `closeDb()` on a database another
+  connection still had open left it exactly there. Anything reading the
+  main file by itself (a file copy, `streamCopyDb`, a backup, a sync
+  that ships the file) saw a truncated or entirely empty database, with
+  no error of any kind.
+
+  The writer now has `PRAGMA synchronous=FULL` and
+  `PRAGMA wal_autocheckpoint=1` pinned when it enters WAL, in that
+  order — `synchronous` governs the fsync a fold performs, so it must
+  be pinned before the second pragma turns every commit into a fold.
+  `synchronous=FULL` was already the effective value (the prebuilt C
+  library reports `DEFAULT_SYNCHRONOUS=2`) and is issued explicitly so
+  this database's durability stops depending on an invisible, unpinned
+  compile-time default of a binary nothing in the Dart describes.
+  `closeDb` now checkpoints itself, **after** its rollback and its
+  statement sweep: a checkpoint issued while a transaction is still
+  open folds nothing (SQLite refuses to checkpoint a connection holding
+  one) and an open reader pins the frames above its snapshot, so that
+  ordering is load-bearing, not incidental. `streamCopyDb` checkpoints
+  before the raw file read, since it copies only the main `.db` and
+  deletes the destination's `-wal` / `-shm`. Both fold PASSIVE and
+  report a shortfall through `dart:developer` rather than failing the
+  operation.
+
+  **Behavior change for consumers:** every commit now checkpoints. The
+  cost is real — see the write-throughput note under *Changed*, where
+  the mitigation is spelled out.
+
+- **A joining `commit()` could end the transaction while its real owner
+  still had work in flight on the writer connection.**
+  `beginTransaction()` is documented, published and test-pinned as
+  idempotent, and stays that way: a second caller's begin is a no-op,
+  and any caller's `commit()` ends the transaction for everyone (there
+  is no reference counting). What was missing was protection for the
+  work the owner still had running when that happened. The reentrant
+  write path in `dbas_sqlite_statement.dart` took a **one-time**
+  `isInTransaction` snapshot and thereafter used the writer connection
+  holding no claim on the writer lock, and FFI dispatch is not
+  connection-pinned (prefer-free worker selection), so that work
+  genuinely kept running after another caller's `COMMIT` had ended the
+  transaction and handed the lock to the next FIFO waiter. The
+  writer-lock accounting itself was already 1:1 correct — the defect
+  was lifetime and ownership, not counting.
+
+  `commit()` now pre-flights before issuing `COMMIT` and throws
+  `commitBlockedByInFlightOperation` (an `executeSql`, an
+  `executeScript`, or the prepare phase of an `executeReader`, started
+  inside this transaction and not finished) or
+  `commitBlockedByActiveReader` (a reader opened inside this
+  transaction and routed to the writer connection for
+  read-your-writes) rather than racing the connection. Readers on a
+  pool connection are never affected — a WAL pool read does not touch
+  the writer. The pre-flight runs **before** the transaction flag or
+  the writer lock is touched, and deliberately bypasses the
+  auto-rollback recovery: it means "called at the wrong time", not "the
+  database failed", so the transaction is left completely untouched and
+  the caller can await the write or close the reader and commit again.
+  Measured, not assumed: a live writer-routed cursor produces no error
+  at all today — it kept stepping four more rows after its transaction
+  had committed and the lock had been handed on. `SQLITE_BUSY` is the
+  production symptom under real isolate timing, not what the harness
+  sees.
+
+  **Behavior change for consumers:** `commit()` can now throw
+  `commitBlockedByInFlightOperation` and `commitBlockedByActiveReader`
+  (both `DbasSqliteErrorCategory.transactionFailed`). Neither is
+  transient — await the write or close the reader, then commit again.
+
+- **An un-awaited write racing `rollback()` completed silently and the
+  row survived the rollback.** The previous justification for leaving
+  `rollback()` un-gated held that the only outcomes were
+  `SQLITE_ABORT` or harmless completion, "never a silent,
+  permanently-persisted write". That is false: 10/10 reproducible.
+  `executeSql` replays its bind buffer one bind per dispatch
+  round-trip, so a write dispatched without `await` inside an open
+  transaction is still walking a chain of pending dispatches when
+  `rollback()` runs; the `ROLLBACK` slips between two of them and the
+  step then executes on a connection already back in autocommit mode.
+  The row commits **on its own**, survives the rollback permanently,
+  and no error is raised on either side. A bind-width sweep (2 to 401
+  binds) shows the window is inherent to the dispatch model, not an
+  artifact of wide statements. `rollback()` now **drains** every
+  in-flight writer dispatch before issuing `ROLLBACK`. It drains rather
+  than throws because `rollback()` is `closeDb()`'s cleanup path and
+  the error-recovery path throughout this class — a new way for it to
+  fail would be a regression, not a safety improvement. Readers are
+  deliberately not drained: a `SELECT` cannot persist anything past a
+  `ROLLBACK`, and SQLite tolerates a `ROLLBACK` with live statements on
+  the connection (unlike `COMMIT`).
+
+  **Behavior change for consumers:** `rollback()` now waits for
+  in-flight writes to finish instead of returning while they are still
+  running.
+
+- **`commit()` swallowed a rollback failure during its own
+  COMMIT-failure recovery.** When `COMMIT` failed, the implicit
+  recovery is to `rollback()`; if that rollback failed too, its failure
+  was logged and the original `COMMIT` exception rethrown, leaving the
+  caller unable to tell "recovered" from "state unknown".
+  `commit()`'s own documentation claimed it mirrored `transaction()`'s
+  handling of the identical shape; it did not. It now throws
+  `commitRollbackAlsoFailed` with the original `COMMIT` failure
+  preserved on `cause` (and its stack on `causeStackTrace`), lifting
+  the original's `sqliteCode` / `sqliteUniqueCode` onto the wrapper. It
+  gets its own code rather than reusing
+  `transactionRollbackAlsoFailed`, so a bare `commit()` can be told
+  apart from one made through `transaction()`. When only the rollback
+  recovery succeeds, the original `commitFailed` is still rethrown
+  unchanged. `commit()` also gained the `isOpened()` guard
+  `beginTransaction()` / `vacuum()` already had, so a database closed
+  while a transaction was still marked active yields
+  `commitDatabaseNotOpened` instead of a raw null-check error.
+
+- **`enableWal()` was a second door into WAL mode that bypassed the WAL
+  writer policy entirely.** The policy above is established in the
+  pooled-open path, but `openDb(readerPoolSize: 0)` opens in
+  `journal_mode=delete` and never runs it — so a following
+  `enableWal()` produced a WAL database carrying the stock
+  `wal_autocheckpoint=1000` with no `synchronous` pin: exactly the
+  silent-loss configuration the pooled path had just been fixed for,
+  reached through the public API by a different entrance. Both doors
+  now route through one shared policy step, so the two cannot drift
+  apart, and whichever door a database enters WAL through it leaves
+  with the same guarantees. A policy failure inside `enableWal()`
+  throws (`walSynchronousFullFailed` / `walAutoCheckpointFailed`) and
+  leaves the connection **open**, unlike the open path which tears its
+  half-built pool down — this one is live and may hold statements,
+  readers and a transaction that are not `enableWal`'s to destroy.
+
+- **`enableWal()` inside a transaction succeeded or failed purely on
+  the journal mode it happened to find.** Measured: SQLite forbids
+  **both** halves of the call inside an open transaction — it cannot
+  switch journal modes there, and `PRAGMA synchronous` answers *"Safety
+  level may not be changed inside a transaction"*. So the call could
+  only ever verify, never establish, and it was not even consistent
+  about that: on a database already in WAL the journal-mode statement
+  was a silent no-op success, while on a `journal_mode=delete` database
+  the same call failed hard. Both configurations now answer alike with
+  `enableWalInsideTransaction`, rejected up front before any pragma
+  runs, mirroring the existing `checkpointInsideTransaction` /
+  `vacuumInsideTransaction` guards.
+
+  **Behavior change for consumers:** `enableWal()` inside a transaction
+  now always throws — but only for a call that established nothing
+  either way. Commit or roll back first.
+
+### Changed
+
+- **Every commit now checkpoints, and that costs write throughput.**
+  `PRAGMA wal_autocheckpoint=1` means each commit folds the WAL back
+  into the main `.db` file, which is what makes committed data actually
+  present in the file a copy, a backup or a sync reads. Measured over
+  three trials of 2000 single-row commits: **1667 ms → 6070 ms**, about
+  **3.5×**, i.e. roughly **+2.2 ms per commit**. Bare
+  `INSERT`/`UPDATE`/`DELETE` outside a transaction is included — each
+  is an implicit transaction that commits.
+
+  The cost is per **commit**, not per row, so the mitigation is
+  batching: N writes inside one `beginTransaction()` / `commit()` pair
+  (or one `transaction()`) pay for one checkpoint, not N. If a bulk
+  path — a first-login sync, a migration, an import loop — got
+  noticeably slower on this version, this is the change responsible,
+  and wrapping the loop in a single transaction is the fix.
+
+- **The writer-lock wait is now bounded for every acquirer.** Callers
+  parked on the writer-lock FIFO queue (`executeSql` outside a
+  transaction, an `executeReader` on a pool-less database,
+  `executeScript`, `beginTransaction` — including every `strict: true`
+  call — `checkpoint`, `streamCopyDb` and `vacuum`) previously waited
+  forever. They now give up after `kWriterLockWaitTimeoutMs` — 30 s,
+  the writer-side twin of the existing `kPoolAcquireTimeoutMs` — and
+  throw `DbasSqliteErrorCode.writerLockWaitTimeout`, categorised
+  `busyOrCancelled`. An unbounded wait is not "safe by default": the
+  caller most likely to be starved is the flow that already owns the
+  lock, and nothing can ever wake it, so the bound turns a silently
+  wedged flow into a diagnosable error. A timed-out waiter removes
+  itself from the queue before failing, so the lock is never handed to
+  a caller that no longer wants it. Genuine contention behind a write
+  that holds the lock longer than 30 s is a retryable
+  `busyOrCancelled`; a `strict: true` self-deadlock is not, and
+  retrying it will time out again.
+
+- **`prepareQuery` / `DbasSqliteStatement.executeSql` are now
+  documented as one statement per call.** The behaviour is unchanged
+  and is now pinned by a test — everything after the first `;` is
+  dropped at prepare time — but the dartdoc said *"Multiple statements
+  may be prepared on the same `DbasSqlite`"*, which reads as
+  reassurance in exactly the wrong direction, and the real limit was
+  admitted only in one aside about an unrelated pragma. It is now
+  stated on both methods, cross-referencing `executeScript`. That the
+  limit went undocumented is part of what let the truncation ship.
+
 ## 2.8.3 - 2026-05-27
 
 ### Fixed
