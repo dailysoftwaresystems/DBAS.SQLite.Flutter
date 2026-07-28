@@ -18,9 +18,13 @@ enum DbasSqliteErrorCode {
 
   // DbasSqlite — WAL
   enableWalDatabaseNotOpened,
+  enableWalInsideTransaction,
   enableWalFailed,
-  openDbSynchronousFullFailed,
-  openDbWalAutoCheckpointFailed,
+  // Not `openDb*`-prefixed: the WAL writer policy is established by
+  // BOTH doors into WAL mode — a pooled `openDb` and `enableWal` — so
+  // either can raise these.
+  walSynchronousFullFailed,
+  walAutoCheckpointFailed,
   checkpointDatabaseNotOpened,
   checkpointInsideTransaction,
   checkpointDatabaseClosedWaitingLock,
@@ -39,6 +43,11 @@ enum DbasSqliteErrorCode {
   rollbackFailed,
   transactionAlreadyActive,
   transactionRollbackAlsoFailed,
+
+  // DbasSqlite — multi-statement script
+  executeScriptDatabaseNotOpened,
+  executeScriptDatabaseClosedWaitingLock,
+  executeScriptFailed,
 
   // DbasSqlite — vacuum
   vacuumDatabaseNotOpened,
@@ -120,6 +129,8 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.commitDatabaseNotOpened:
       case DbasSqliteErrorCode.vacuumDatabaseNotOpened:
       case DbasSqliteErrorCode.vacuumDatabaseClosedWaitingLock:
+      case DbasSqliteErrorCode.executeScriptDatabaseNotOpened:
+      case DbasSqliteErrorCode.executeScriptDatabaseClosedWaitingLock:
       case DbasSqliteErrorCode.checkpointDatabaseNotOpened:
       case DbasSqliteErrorCode.checkpointDatabaseClosedWaitingLock:
       case DbasSqliteErrorCode.statementClosed:
@@ -144,6 +155,12 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
 
       case DbasSqliteErrorCode.executeSqlStepFailed:
       case DbasSqliteErrorCode.readRowFailed:
+      // A script carries arbitrary DDL/DML, so a failure inside it is a
+      // statement failure like any other — NOT the `transactionFailed`
+      // bucket `vacuumFailed` sits in, which covers the one-shot
+      // transaction VERBS (BEGIN/COMMIT/ROLLBACK/VACUUM). Same reasoning
+      // as `checkpointFailed` below.
+      case DbasSqliteErrorCode.executeScriptFailed:
       // `PRAGMA wal_checkpoint` is stepped as a statement (its
       // `(busy, log, checkpointed)` row is the whole point), so a
       // failure here is a step failure like any other — NOT the
@@ -172,10 +189,11 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.transactionRollbackAlsoFailed:
       case DbasSqliteErrorCode.vacuumInsideTransaction:
       case DbasSqliteErrorCode.vacuumFailed:
-      // Joins `vacuumInsideTransaction`: same "wrong time to call this"
-      // shape, and the root cause is the transaction state, not the
-      // checkpoint itself.
+      // Both join `vacuumInsideTransaction`: same "wrong time to call
+      // this" shape, and the root cause is the transaction state, not
+      // the checkpoint or the journal-mode switch itself.
       case DbasSqliteErrorCode.checkpointInsideTransaction:
+      case DbasSqliteErrorCode.enableWalInsideTransaction:
         return DbasSqliteErrorCategory.transactionFailed;
 
       case DbasSqliteErrorCode.readerAlreadyActive:
@@ -188,12 +206,12 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
         return DbasSqliteErrorCategory.decodeFailed;
 
       case DbasSqliteErrorCode.openDbReopenWithDifferentPoolSize:
-      // All three are openDb-path failures with no dedicated category
-      // and no consumer-side recovery beyond "the open failed"; the two
-      // pragma ones should be unreachable in practice — they are pure
+      // All three have no dedicated category and no consumer-side
+      // recovery beyond "the call failed"; the two WAL writer-policy
+      // ones should be unreachable in practice — they are pure
       // connection settings with no I/O.
-      case DbasSqliteErrorCode.openDbSynchronousFullFailed:
-      case DbasSqliteErrorCode.openDbWalAutoCheckpointFailed:
+      case DbasSqliteErrorCode.walSynchronousFullFailed:
+      case DbasSqliteErrorCode.walAutoCheckpointFailed:
         return DbasSqliteErrorCategory.internal;
     }
   }

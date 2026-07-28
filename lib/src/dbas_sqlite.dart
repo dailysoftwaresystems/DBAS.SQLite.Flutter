@@ -444,15 +444,25 @@ class DbasSqlite {
         _readerPoolSize = readerPoolSize;
         _readerSlotsAvailable = readerPoolSize;
         final writerPtr = _platform.poolGetWriter(dbName, poolPtr);
-        _db = DbasSqliteDb(dbName, writerPtr);
-        // The pooled open is the ONLY path that OPENS the database in
-        // `journal_mode=wal`, so this is where the WAL's fold policy and
-        // the durability it folds under have to be established — before
-        // the writer is handed to any caller. Order is load-bearing:
-        // `synchronous` governs the fsync a checkpoint performs, so it
-        // is pinned BEFORE the next line turns every commit into one.
-        await _pinWriterSynchronousFull();
-        await _enableWriterAutoCheckpoint();
+        final writer = DbasSqliteDb(dbName, writerPtr);
+        _db = writer;
+        // The pooled open is the only path that OPENS the database in
+        // `journal_mode=wal`, so the WAL writer policy is established
+        // here, before the writer is handed to any caller. [enableWal]
+        // is the OTHER door into WAL mode and establishes the same
+        // policy itself — see [_pinWalWriterSettings].
+        //
+        // Failing the policy is fatal to the OPEN specifically: the
+        // half-built pool is torn down so no caller can ever be handed a
+        // writer whose WAL policy is unknown. That teardown belongs to
+        // this caller, NOT to the shared pragma helper — [enableWal]
+        // runs on a live, published connection and must not destroy it.
+        try {
+          await _pinWalWriterSettings(writer, caller: 'openDb');
+        } catch (e) {
+          await _tearDownFailedPoolOpen(e);
+          rethrow;
+        }
         return;
       }
     }
@@ -462,7 +472,47 @@ class DbasSqlite {
     _db = await _platform.openDb(fileName);
   }
 
-  /// Pins the pool writer's fsync policy: `PRAGMA synchronous=FULL`.
+  /// Establishes the **WAL writer policy** on [writer]: the fsync
+  /// durability a fold runs under, then the fold itself.
+  ///
+  /// Called from BOTH doors into WAL mode, so a database carries the
+  /// same guarantees whichever one it came through:
+  ///   - [_performOpen]'s pooled branch, which OPENS the database in
+  ///     `journal_mode=wal`;
+  ///   - [enableWal], which moves an **already-open** connection into
+  ///     WAL. That covers `openDb(readerPoolSize: 0)`, which opens in
+  ///     `journal_mode=delete` (measured) and therefore never runs the
+  ///     open-time branch at all — before this was shared, such a
+  ///     connection reached WAL carrying the stock
+  ///     `wal_autocheckpoint=1000` and an unpinned `synchronous`, which
+  ///     is precisely the silent-data-loss configuration the two
+  ///     pragmas exist to prevent.
+  ///
+  /// Order is **load-bearing**: `synchronous` governs the fsync a
+  /// checkpoint performs, so it is pinned BEFORE the second pragma turns
+  /// every commit into a checkpoint — no fold may run under an unpinned
+  /// durability.
+  ///
+  /// **Idempotent.** Each pragma sets a connection-level value to a
+  /// fixed constant, so re-applying them returns `SQLITE_OK` and changes
+  /// nothing. That is what keeps a second [enableWal] — and an
+  /// [enableWal] on a pooled database that already ran them at open —
+  /// a harmless no-op rather than a double-application with a side
+  /// effect.
+  ///
+  /// [caller] names the public method in any thrown message. What a
+  /// failure does BEYOND throwing is the caller's decision: see
+  /// [_performOpen], which tears the half-built pool down, versus
+  /// [enableWal], which leaves the live connection standing.
+  Future<void> _pinWalWriterSettings(
+    DbasSqliteDb writer, {
+    required String caller,
+  }) async {
+    await _pinWriterSynchronousFull(writer, caller);
+    await _enableWriterAutoCheckpoint(writer, caller);
+  }
+
+  /// Pins the [writer]'s fsync policy: `PRAGMA synchronous=FULL`.
   ///
   /// **This changes no behaviour.** FULL is already the value — the
   /// prebuilt C library reports `DEFAULT_SYNCHRONOUS=2` and
@@ -477,35 +527,37 @@ class DbasSqlite {
   /// puts the intent next to [_enableWriterAutoCheckpoint]'s fold
   /// policy, where a reader of this file can actually see it.
   ///
-  /// `synchronous` is a **connection-level** setting applied once at
-  /// open, **never per commit**. It governs the fsync SQLite performs
-  /// both when a transaction commits and when a checkpoint folds the
-  /// WAL back into the main `.db` — which is why it is pinned BEFORE
-  /// [_enableWriterAutoCheckpoint] turns every commit into a
-  /// checkpoint, so no fold can run under an unpinned durability.
+  /// `synchronous` is a **connection-level** setting applied once when
+  /// the connection enters WAL, **never per commit**. It governs the
+  /// fsync SQLite performs both when a transaction commits and when a
+  /// checkpoint folds the WAL back into the main `.db` — which is why it
+  /// is pinned BEFORE [_enableWriterAutoCheckpoint] turns every commit
+  /// into a checkpoint, so no fold can run under an unpinned durability.
   ///
-  /// A failure is **fatal to the open** and throws
-  /// [DbasSqliteErrorCode.openDbSynchronousFullFailed] — the same policy
+  /// A failure throws
+  /// [DbasSqliteErrorCode.walSynchronousFullFailed] — the same policy
   /// as [_enableWriterAutoCheckpoint], through the shared
-  /// [_applyOpenTimeWriterPragma]: the half-built pool is torn down
-  /// first and the instance is left cleanly not-open.
+  /// [_applyWalWriterPragma]. What happens beyond the throw belongs to
+  /// the caller; see [_pinWalWriterSettings].
   ///
   /// **Web:** no-op. `web/libs/dbas_sqlite_worker.js` already issues
   /// `PRAGMA synchronous=FULL` on the writer role during worker init and
   /// fails pool creation with `INIT_FAILED` if it cannot, so the
   /// guarantee is established there — same policy, enforced one layer
   /// down. Mirrors [setBusyTimeout]'s web no-op rationale.
-  Future<void> _pinWriterSynchronousFull() {
-    return _applyOpenTimeWriterPragma(
+  Future<void> _pinWriterSynchronousFull(DbasSqliteDb writer, String caller) {
+    return _applyWalWriterPragma(
+      writer,
+      caller,
       'PRAGMA synchronous=FULL',
-      DbasSqliteErrorCode.openDbSynchronousFullFailed,
+      DbasSqliteErrorCode.walSynchronousFullFailed,
       'The writer would silently fall back to whatever durability the '
       'prebuilt C library happens to be compiled with — an invisible, '
       'unpinned default.',
     );
   }
 
-  /// Configures the pool's writer connection so **every** commit folds
+  /// Configures the [writer] connection so **every** commit folds
   /// the WAL back into the main `.db` file.
   ///
   /// Until this pragma runs, the writer inherits SQLite's stock
@@ -519,91 +571,99 @@ class DbasSqlite {
   /// `=1` checkpoints after every commit, which covers bare
   /// `INSERT`/`UPDATE`/`DELETE` too: each is an implicit transaction
   /// that commits. It is a single statement, so it is unaffected by the
-  /// one-statement limit of the `executeSql` prepare path.
+  /// one-statement limit of the `executeSql` prepare path — the limit
+  /// [executeScript] exists to lift.
   ///
-  /// A failure is **fatal to the open** and throws
-  /// [DbasSqliteErrorCode.openDbWalAutoCheckpointFailed]: publishing a
+  /// A failure throws
+  /// [DbasSqliteErrorCode.walAutoCheckpointFailed]: handing out a
   /// writer that silently hoards WAL frames is the exact bug this
-  /// pragma exists to prevent, so the half-built pool is torn down
-  /// first — through the shared [_applyOpenTimeWriterPragma] — and the
-  /// instance is left cleanly not-open.
+  /// pragma exists to prevent. It fails under the same policy as
+  /// [_pinWriterSynchronousFull], through the shared
+  /// [_applyWalWriterPragma]; what happens beyond the throw belongs to
+  /// the caller, see [_pinWalWriterSettings].
   ///
   /// **Web:** no-op. `web/libs/dbas_sqlite_worker.js` already issues
   /// `PRAGMA wal_autocheckpoint=1` on the writer role during worker
   /// init and fails pool creation with `INIT_FAILED` if it cannot, so
   /// the guarantee is established there — same policy, enforced one
   /// layer down. Mirrors [setBusyTimeout]'s web no-op rationale.
-  Future<void> _enableWriterAutoCheckpoint() {
-    return _applyOpenTimeWriterPragma(
+  Future<void> _enableWriterAutoCheckpoint(
+      DbasSqliteDb writer, String caller) {
+    return _applyWalWriterPragma(
+      writer,
+      caller,
       'PRAGMA wal_autocheckpoint=1',
-      DbasSqliteErrorCode.openDbWalAutoCheckpointFailed,
+      DbasSqliteErrorCode.walAutoCheckpointFailed,
       'Without it, committed data would stay in the -wal and any read of '
       'the main .db file alone would silently miss it.',
     );
   }
 
-  /// Issues one open-time writer [pragma] and makes any failure **fatal
-  /// to the open**: the half-built pool is torn down and [code] is
-  /// thrown, so no caller can ever be handed a writer whose WAL policy
-  /// is unknown.
+  /// Issues one WAL writer-policy [pragma] on [writer] and turns any
+  /// failure into a thrown [code], so no caller is ever left holding a
+  /// writer whose WAL policy is unknown **without being told**.
   ///
   /// Shared by [_pinWriterSynchronousFull] and
-  /// [_enableWriterAutoCheckpoint] so both open-time pragmas fail under
-  /// **one** policy instead of two that can drift apart. Each caller
-  /// still names its own [code] and its own [consequence] — the sentence
-  /// spelling out what the writer would silently do if the pragma were
-  /// skipped, which is the part of the thrown message that carries the
-  /// diagnosis.
+  /// [_enableWriterAutoCheckpoint] so both pragmas fail under **one**
+  /// policy instead of two that can drift apart. Each caller still names
+  /// its own [code] and its own [consequence] — the sentence spelling
+  /// out what the writer would silently do if the pragma were skipped,
+  /// which is the part of the thrown message that carries the diagnosis.
+  /// [caller] is the public method that asked for the policy and
+  /// prefixes the message.
   ///
-  /// Order inside this method is **load-bearing**: the SQLite
-  /// diagnostics are captured BEFORE [_tearDownFailedPoolOpen] runs,
-  /// because the teardown nulls [_db] and `getLastDbError` /
-  /// `getErrorCode` / `getUniqueErrorCode` need the live connection to
-  /// reach `sqlite3_errcode` / `sqlite3_extended_errcode`. Keeping the
-  /// capture and the teardown in one method is what stops that ordering
-  /// from being a rule each caller has to remember.
+  /// This method **throws and nothing more**. Recovery is deliberately
+  /// the caller's: an open that fails here has a half-built pool to tear
+  /// down ([_performOpen]), whereas [enableWal] is called on a live,
+  /// published connection that may hold statements, readers and a
+  /// transaction — tearing that down would be destruction, not safety.
+  /// Because the SQLite diagnostics below are read into the exception
+  /// BEFORE it is thrown, any teardown a caller runs in its `catch` is
+  /// already downstream of the capture, so the old "capture before the
+  /// teardown nulls `_db`" ordering rule cannot be got wrong.
+  ///
+  /// [writer] is passed in rather than re-read from `_db` so the whole
+  /// policy is applied to the connection the caller resolved, even if a
+  /// concurrent `closeDb` nulls the field mid-flight.
   ///
   /// **Web:** no-op — the worker establishes both pragmas itself; see
   /// the two callers for the per-pragma rationale.
-  Future<void> _applyOpenTimeWriterPragma(
+  Future<void> _applyWalWriterPragma(
+    DbasSqliteDb writer,
+    String caller,
     String pragma,
     DbasSqliteErrorCode code,
     String consequence,
   ) async {
     if (kIsWeb) return;
 
-    final rc = await _platform.executeSql(_db!, pragma);
+    final rc = await _platform.executeSql(writer, pragma);
     if (rc == sqliteOk) return;
 
-    // Load-bearing order: capture BEFORE the teardown nulls `_db`.
-    final err = _platform.getLastDbError(_db!) ?? 'rc=$rc';
-    final primary = _platform.getErrorCode(_db!) ?? rc;
-    final unique = _platform.getUniqueErrorCode(_db!);
-    await _tearDownFailedPoolOpen(pragma);
+    final err = _platform.getLastDbError(writer) ?? 'rc=$rc';
+    final primary = _platform.getErrorCode(writer) ?? rc;
+    final unique = _platform.getUniqueErrorCode(writer);
     throw DbasSqliteException.sqlite(
       code,
-      'openDb("$dbName"): $pragma failed on the pool writer: $err. '
-      '$consequence So the open is rejected rather than completed.',
+      '$caller("$dbName"): $pragma failed on the writer: $err. '
+      '$consequence So $caller is rejected rather than completed.',
       sqliteCode: primary,
       sqliteUniqueCode: unique,
     );
   }
 
-  /// Tears the half-built pool down after an open-time writer pragma
-  /// failed, leaving the instance cleanly **not-open**.
+  /// Tears the half-built pool down after the WAL writer policy failed
+  /// during an open, leaving the instance cleanly **not-open**.
   ///
-  /// Called only by [_applyOpenTimeWriterPragma], which captures the
-  /// SQLite diagnostics (`getLastDbError` / `getErrorCode` /
-  /// `getUniqueErrorCode`) BEFORE handing over — **load-bearing**,
-  /// because this method nulls [_db] and those helpers need the live
-  /// connection to reach `sqlite3_errcode` /
-  /// `sqlite3_extended_errcode`. [pragma] names the statement that
-  /// failed and appears only in the teardown log.
+  /// Called only from [_performOpen]'s `catch`. [cause] is the
+  /// [_applyWalWriterPragma] failure that triggered the teardown; it
+  /// already carries the SQLite diagnostics, which is why this method is
+  /// free to null [_db] — and it appears here only in the teardown log.
   ///
-  /// A `closePool` failure here is logged and swallowed: the pragma
-  /// failure is the error the caller is about to throw, and replacing it
-  /// with a teardown failure would bury the real cause.
-  Future<void> _tearDownFailedPoolOpen(String pragma) async {
+  /// A `closePool` failure here is logged and swallowed: [cause] is the
+  /// error the caller is about to rethrow, and replacing it with a
+  /// teardown failure would bury the real diagnosis.
+  Future<void> _tearDownFailedPoolOpen(Object cause) async {
     final poolPtr = _poolPtr;
     if (poolPtr != null) {
       try {
@@ -611,7 +671,7 @@ class DbasSqlite {
       } catch (e, st) {
         developer.log(
           'openDb("$dbName"): closePool during open-failure teardown '
-          'after "$pragma" failed',
+          'after the WAL writer policy failed ($cause)',
           name: 'dbas_sqlite.DbasSqlite',
           error: e,
           stackTrace: st,
@@ -781,14 +841,25 @@ class DbasSqlite {
   /// Prepares a SQL statement. Returns a [DbasSqliteStatement] that
   /// owns parameter binding and execution.
   ///
+  /// **[sql] must be ONE statement.** Everything after the first `;` is
+  /// **silently discarded** — the returned statement prepares, steps and
+  /// finalizes only the first, and the C layer passes `sqlite3_prepare_v2`
+  /// a `nullptr` tail pointer, so the rest never reaches SQLite at all.
+  /// There is no rc, no exception and no log: measured, a
+  /// `CREATE TABLE …; CREATE UNIQUE INDEX …;` string returns success
+  /// with the table created and the index **missing**. For a script of
+  /// several statements use [executeScript], which routes to
+  /// `sqlite3_exec` and runs all of them.
+  ///
   /// The statement holds the SQL until executed; the underlying
   /// native handle is allocated lazily at execute time on the
   /// connection appropriate for the execution mode (writer for
   /// `executeSql`, pool reader for `executeReader` outside
   /// transactions, writer inside transactions).
   ///
-  /// Multiple statements may be prepared on the same `DbasSqlite`
-  /// without blocking each other. Caller MUST call
+  /// Several statement OBJECTS may be prepared on the same `DbasSqlite`
+  /// without blocking each other — that concurrency is unrelated to the
+  /// one-statement-per-`sql` limit above. Caller MUST call
   /// [DbasSqliteStatement.close] when done; closing the database
   /// auto-closes any still-open statements as a safety net.
   Future<DbasSqliteStatement> prepareQuery(String sql) async {
@@ -928,7 +999,25 @@ class DbasSqlite {
     }
   }
 
-  /// Switches the writer to WAL journal mode and verifies the readback.
+  /// Switches the writer to WAL journal mode, verifies the readback, and
+  /// establishes the **same WAL writer policy a pooled open does**.
+  ///
+  /// This is the second door into WAL mode. `openDb(readerPoolSize: 0)`
+  /// opens in `journal_mode=delete` (measured), so it deliberately skips
+  /// the open-time writer pragmas — there is no WAL for them to govern.
+  /// Calling this method afterwards creates one. Without
+  /// [_pinWalWriterSettings] below, that database would run WAL on
+  /// SQLite's stock `wal_autocheckpoint=1000` with an unpinned
+  /// `synchronous`: committed frames pile up in the `-wal` and any read
+  /// of the main `.db` file alone silently misses them — the exact
+  /// silent-data-loss bug the open path exists to prevent, reached
+  /// through the public API by a different door. Whichever door a
+  /// database enters WAL through, it leaves with the same guarantees.
+  ///
+  /// **Idempotent.** Both the journal-mode switch and the two pragmas
+  /// are no-ops when already in effect, so a second call — or a call on
+  /// a pooled database that already ran the pragmas at open — changes
+  /// nothing and succeeds.
   ///
   /// **Native:** dispatches to the C lib's `EnableWal` (idempotent on
   /// a pool that's already in WAL).
@@ -936,29 +1025,67 @@ class DbasSqlite {
   /// **Web:** runs `PRAGMA journal_mode` and verifies the result is
   /// `wal`. The JS pool always opens with WAL via the writer worker;
   /// this serves as a defensive check that pool initialization
-  /// actually succeeded.
+  /// actually succeeded. The policy pragmas are a no-op there — the
+  /// worker issues both itself at init.
   ///
-  /// Throws an exception when WAL cannot be activated (read-only
-  /// media, unsupported VFS, or — on web — pool init silently
-  /// failing to set WAL).
+  /// Throws:
+  ///   - [DbasSqliteErrorCode.enableWalDatabaseNotOpened] — the database
+  ///     is not open.
+  ///   - [DbasSqliteErrorCode.enableWalInsideTransaction] — a
+  ///     transaction is active on this instance. SQLite forbids **both**
+  ///     halves of this call inside one: `PRAGMA journal_mode=WAL`
+  ///     cannot switch journal modes there, and `PRAGMA synchronous`
+  ///     answers *"Safety level may not be changed inside a
+  ///     transaction"* (measured). So the call could only ever verify,
+  ///     never establish — and before this guard it did neither
+  ///     consistently: on a database already in WAL the journal-mode
+  ///     statement was a silent no-op success, so the same call
+  ///     "succeeded" or failed purely on the journal mode it happened to
+  ///     find. Rejecting it up front, before any pragma runs, makes both
+  ///     configurations behave alike. Commit or roll back first.
+  ///   - [DbasSqliteErrorCode.enableWalFailed] — WAL could not be
+  ///     activated (read-only media, unsupported VFS, or — on web —
+  ///     pool init silently failing to set WAL).
+  ///   - [DbasSqliteErrorCode.walSynchronousFullFailed] /
+  ///     [DbasSqliteErrorCode.walAutoCheckpointFailed] — WAL was
+  ///     activated but its policy could not be established. **The
+  ///     connection is left open**, unlike the open path, which tears
+  ///     its half-built pool down: this one is live and may hold
+  ///     statements, readers and a transaction that are not this
+  ///     method's to destroy. The database is in WAL under an unknown
+  ///     fold policy, which is why the failure is loud — a caller that
+  ///     cannot proceed on those terms should close it.
   Future<void> enableWal() async {
-    if (_db == null) {
+    final writer = _db;
+    if (writer == null) {
       throw DbasSqliteException.dart(
         DbasSqliteErrorCode.enableWalDatabaseNotOpened,
         'Database is not opened.',
       );
     }
-    final rc = await _platform.enableWal(_db!);
+    if (_isInTransaction) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.enableWalInsideTransaction,
+        'Cannot enable WAL inside a transaction: SQLite can neither '
+        'switch journal modes nor change the safety level there, so the '
+        'call could not establish the WAL writer policy it promises. '
+        'Commit or roll back first.',
+      );
+    }
+    final rc = await _platform.enableWal(writer);
     if (rc != sqliteOk) {
-      final err = _platform.getLastDbError(_db!) ?? 'rc=$rc';
-      final primary = _platform.getErrorCode(_db!) ?? rc;
+      final err = _platform.getLastDbError(writer) ?? 'rc=$rc';
+      final primary = _platform.getErrorCode(writer) ?? rc;
       throw DbasSqliteException.sqlite(
         DbasSqliteErrorCode.enableWalFailed,
         'enableWal failed: $err',
         sqliteCode: primary,
-        sqliteUniqueCode: _platform.getUniqueErrorCode(_db!),
+        sqliteUniqueCode: _platform.getUniqueErrorCode(writer),
       );
     }
+    // Only reached once the connection really is in WAL, so the policy
+    // always lands on a journal mode that has something for it to govern.
+    await _pinWalWriterSettings(writer, caller: 'enableWal');
   }
 
   // ── WAL checkpoint ───────────────────────────────────────────────────
@@ -1664,8 +1791,167 @@ class DbasSqlite {
     }
   }
 
+  // ── Multi-statement script ───────────────────────────────────────────
+
+  /// Runs a **whole SQL script** — every statement in [sql], not just
+  /// the first.
+  ///
+  /// This is the **only** entry point in this library that executes more
+  /// than one statement per call. [prepareQuery] +
+  /// [DbasSqliteStatement.executeSql] prepare, step and finalize exactly
+  /// ONE statement and **silently discard everything after the first
+  /// `;`**: measured, `CREATE TABLE …; CREATE UNIQUE INDEX …;
+  /// PRAGMA foreign_keys = ON;` through that path returns `rc=0` with no
+  /// exception and no log, and leaves the table present, the index
+  /// **absent** and `foreign_keys` still `0`. Use `executeScript`
+  /// whenever [sql] may hold more than one statement — runtime DDL plus
+  /// its indexes, a migration step, an open-time pragma block.
+  ///
+  /// Routes to the C `ExecuteSql` entry point (`sqlite3_exec`), which
+  /// iterates the statements itself. **Nothing splits on `;` in Dart**,
+  /// and nothing may: `sqlite3_complete` is not exported by the shipped
+  /// binary, so a Dart detector would have to hand-roll a lexer over
+  /// quoted literals, bracketed identifiers, comments, blob literals and
+  /// `BEGIN … END` trigger bodies — and any script carrying a `CHECK`
+  /// body of arbitrary user SQL would be shredded by a naive split.
+  ///
+  /// **NOT ATOMIC on its own — read this twice.** Execution stops at the
+  /// first statement that fails, and every statement before it has
+  /// already run. Outside a transaction each of those is its own
+  /// implicit transaction, so they are already **committed** and nothing
+  /// can take them back. A script that must be all-or-nothing MUST be
+  /// wrapped by the caller:
+  ///
+  /// ```dart
+  /// await db.transaction((tx) => tx.executeScript(migrationSql));
+  /// ```
+  ///
+  /// **Allowed inside a transaction**, deliberately — this does NOT copy
+  /// [vacuum]'s or [checkpoint]'s in-transaction guard. Those two reject
+  /// because SQLite itself refuses them there, so the call could only
+  /// pretend to work. A script has no such objection, and wrapping it in
+  /// a transaction is the *only* way to get the atomicity above; a guard
+  /// here would leave callers with nothing but the unsafe mode. Inside a
+  /// transaction the call registers as a reentrant writer user rather
+  /// than taking the writer lock — [beginTransaction] already holds it
+  /// and the queue is FIFO, so re-acquiring would park behind itself.
+  ///
+  /// **No bindings.** `sqlite3_exec` has no bind surface, so [sql] must
+  /// be complete text. Parameterised SQL belongs on [prepareQuery];
+  /// never interpolate untrusted values into a script.
+  ///
+  /// **Result rows are discarded.** The `sqlite3_exec` callback is
+  /// `nullptr`, so a `SELECT` in the script runs and yields nothing. To
+  /// read rows use [prepareQuery] with
+  /// [DbasSqliteStatement.executeReader] — that is exactly why
+  /// `PRAGMA wal_checkpoint` deliberately avoids this path (see
+  /// [checkpoint]): its `(busy, log, checkpointed)` row is the point.
+  ///
+  /// Returns the connection's `sqlite3_changes64` read **after** the
+  /// script, so it can stand in for [DbasSqliteStatement.executeSql]'s
+  /// return. The C header names the connection-scoped counters as
+  /// existing precisely for `ExecuteSql` callers — no statement handle
+  /// exists in this flow. It is therefore the count of the **last
+  /// row-changing statement** in the script, not a total: a script
+  /// ending in DDL or a `SELECT` still reports the last
+  /// `INSERT`/`UPDATE`/`DELETE`, and a script containing none at all
+  /// reports whatever the connection last left there, which may predate
+  /// this call.
+  ///
+  /// **Web caveat.** The worker's `exec` action refuses with
+  /// `SQLITE_BUSY` — *"Cannot write while a read statement is open on
+  /// this worker"* — whenever the writer worker still has an open
+  /// statement. In practice that means a live [DbasSqliteReader] on the
+  /// **writer** connection blocks a script: readers route to the writer
+  /// once the current transaction has performed a write, so a script
+  /// issued mid-transaction while a cursor from that same transaction is
+  /// still open fails on web where it succeeds natively. Close the
+  /// reader first. This is not new to `executeScript` — every
+  /// `executeSql`-routed verb ([beginTransaction], [commit], [rollback],
+  /// [vacuum]) shares it — but a script is the call most likely to be
+  /// issued in the middle of other work.
+  ///
+  /// Throws:
+  ///   - [DbasSqliteErrorCode.executeScriptDatabaseNotOpened] — the
+  ///     database is not open.
+  ///   - [DbasSqliteErrorCode.executeScriptDatabaseClosedWaitingLock] —
+  ///     the database was closed while this call waited for the writer
+  ///     lock.
+  ///   - [DbasSqliteErrorCode.executeScriptFailed] — a statement in the
+  ///     script failed. The message carries `sqlite3_exec`'s `errMsg`,
+  ///     which names the offending statement; everything before it has
+  ///     already run.
+  Future<int> executeScript(String sql) async {
+    if (!isOpened()) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.executeScriptDatabaseNotOpened,
+        'Database is not opened.',
+      );
+    }
+    // Mirrors DbasSqliteStatement.executeSql's lock decision, and for
+    // the same reason: inside a transaction the writer lock is already
+    // held for the transaction's whole lifetime, so re-acquiring it on a
+    // FIFO queue would deadlock against ourselves. Registering instead
+    // is what lets `commit()` see that this dispatch is still live on
+    // the writer connection.
+    final lockHeld = _isInTransaction;
+    ReentrantWriterOpToken? reentrantOp;
+    if (lockHeld) {
+      reentrantOp = beginReentrantWriterOpInternal();
+    } else {
+      await _acquireWriterLock();
+    }
+    try {
+      if (!isOpened()) {
+        throw DbasSqliteException.dart(
+          DbasSqliteErrorCode.executeScriptDatabaseClosedWaitingLock,
+          'Database was closed while waiting for writer lock.',
+        );
+      }
+      final conn = _db!;
+      // A script is assumed to write: it is the DDL/DML door. Marking
+      // before dispatch is conservative in the same way `executeSql`'s
+      // is — a failed script still routes later reads through the writer,
+      // which is slower but never incorrect.
+      markTransactionWriteInternal();
+      // Ordering is **load-bearing**: start the dispatch WITHOUT awaiting
+      // so its still-pending future reaches the database before this
+      // method suspends. `rollback()` drains that future instead of
+      // issuing ROLLBACK on top of it. Registration, mark and dispatch
+      // all run in this one synchronous turn, so no other flow can
+      // observe a half-registered script.
+      final dispatch = _platform.executeSql(conn, sql);
+      if (reentrantOp != null) {
+        trackReentrantWriterOpDispatchInternal(reentrantOp, dispatch);
+      }
+      final rc = await dispatch;
+      if (rc != sqliteOk) {
+        final err = _platform.getLastDbError(conn) ?? 'rc=$rc';
+        final primary = _platform.getErrorCode(conn) ?? rc;
+        throw DbasSqliteException.sqlite(
+          DbasSqliteErrorCode.executeScriptFailed,
+          'Script failed (rc=$rc): $err. Execution stopped there; every '
+          'statement before it has already run, and outside a transaction '
+          'those are already committed.',
+          sqliteCode: primary,
+          sqliteUniqueCode: _platform.getUniqueErrorCode(conn),
+        );
+      }
+      return _platform.getAffectedRows(conn);
+    } finally {
+      if (reentrantOp != null) {
+        endReentrantWriterOpInternal(reentrantOp);
+      } else {
+        _releaseWriterLock();
+      }
+    }
+  }
+
   /// Rebuilds the database file via VACUUM. Cannot run inside a
   /// transaction.
+  ///
+  /// Single-statement by nature — for a multi-statement string use
+  /// [executeScript].
   Future<void> vacuum() async {
     if (!isOpened()) {
       throw DbasSqliteException.dart(

@@ -12,11 +12,18 @@ import 'package:dbas_sqlite/src/dbas_sqlite_reader.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_row_cache.dart';
 import 'package:dbas_sqlite/src/exceptions/dbas_sqlite_exception.dart';
 
-/// A prepared SQL statement.
+/// A prepared SQL statement — **exactly one** statement.
 ///
 /// Owns its own bind buffers (positional + named) and dispatches
 /// execution through the platform layer. Use [DbasSqlite.prepareQuery]
 /// to obtain one — never construct directly.
+///
+/// **One statement per object, and the limit is silent.** The whole
+/// lifecycle is one `sqlite3_prepare_v2` / one step / one
+/// `sqlite3_finalize`, and the C layer passes the prepare a `nullptr`
+/// tail pointer, so everything after the first `;` in the SQL is
+/// discarded before SQLite ever sees it — with no rc, no exception and
+/// no log. For a multi-statement script use [DbasSqlite.executeScript].
 ///
 /// The native handle is allocated lazily at execute time on the
 /// connection appropriate for the execution mode (writer for
@@ -210,6 +217,13 @@ class DbasSqliteStatement {
   /// Executes the prepared statement as DML/DDL. Returns affected
   /// rows. Pass [params] / [nameParams] to replace the bind buffer
   /// before execution (mirroring the v2.3.x convenience shape).
+  ///
+  /// **Runs the FIRST statement of the SQL and nothing else.** One
+  /// prepare, one step, one finalize — anything after the first `;` was
+  /// already dropped at prepare time and this call reports success
+  /// regardless. If the SQL can hold more than one statement, this is
+  /// the wrong method: use [DbasSqlite.executeScript], which routes to
+  /// `sqlite3_exec` and runs the whole script.
   ///
   /// The Dart-side bind buffer is preserved on failure — fix the
   /// offending value and call again without re-binding the rest.

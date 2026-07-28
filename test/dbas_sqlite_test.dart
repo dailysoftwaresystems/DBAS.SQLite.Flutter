@@ -6984,4 +6984,436 @@ void main() async {
         reason: 'a pooled open must put the database in WAL mode; without '
             'it neither of the two settings above has anything to govern');
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // enableWal() is the OTHER door into WAL mode
+  //
+  // The open-time writer pragmas above are applied on the pooled branch
+  // of `_performOpen` only, because that is the only branch that OPENS
+  // in `journal_mode=wal`. But `enableWal()` is public and moves an
+  // already-open connection INTO WAL by itself. `openDb(readerPoolSize:
+  // 0)` opens in `journal_mode=delete` (measured), so the open-time
+  // pragmas are deliberately skipped there — and a consumer that then
+  // calls `enableWal()` reaches a WAL database carrying the stock
+  // `wal_autocheckpoint=1000` and an unpinned `synchronous`: exactly the
+  // silent-data-loss configuration the pragmas above exist to prevent,
+  // reached through the public API by a different door.
+  //
+  // Whichever door a database enters WAL through, it must leave with the
+  // same guarantees.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test(
+      'WAL checkpoint: enableWal on a pool-less open pins the same writer settings as a pooled open',
+      () async {
+    // `readerPoolSize: 0` is the point of this test, not an economy: it
+    // opens in `journal_mode=delete`, so WAL here can only come from the
+    // `enableWal()` call below — the path the open-time pragmas do not
+    // cover.
+    final db = await _createTestDb('wal_enable_wal_pin.db');
+    await db.enableWal();
+
+    // Readback rule as in the pooled pin test above: `synchronous` and
+    // `wal_autocheckpoint` are per-connection, so they must be read off
+    // the WRITER. There is no pool on this path, so every read already
+    // lands on the single writer connection; the transaction-after-a-
+    // write shape is kept anyway so both pin tests measure the same way
+    // and `wal_autocheckpoint == 1` keeps working as the witness that
+    // the readback hit the writer.
+    await _runSql(db, 'CREATE TABLE enable_wal_pin_tbl (id INTEGER PRIMARY KEY)');
+    await db.beginTransaction();
+    await _runSql(db, 'INSERT INTO enable_wal_pin_tbl (id) VALUES (1)');
+
+    Future<Object?> readPragma(String pragma) async {
+      final stmt = await db.prepareQuery('PRAGMA $pragma');
+      return await stmt.executeScalar();
+    }
+
+    final synchronous = await readPragma('synchronous');
+    final autoCheckpoint = await readPragma('wal_autocheckpoint');
+    final journalMode = await readPragma('journal_mode');
+
+    await db.rollback();
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(journalMode, 'wal',
+        reason: 'enableWal() must actually move the pool-less connection '
+            'into WAL — without it the two settings below govern nothing');
+    expect(autoCheckpoint, 1,
+        reason: 'enableWal() put this database in WAL, so it owes the same '
+            'fold policy a pooled open establishes. 1000 here is SQLite\'s '
+            'stock DEFAULT_WAL_AUTOCHECKPOINT: committed frames would sit '
+            'in the -wal and any read of the main .db file alone would '
+            'silently miss them');
+    expect(synchronous, 2,
+        reason: 'the writer must run at synchronous=FULL (2) once it is in '
+            'WAL, pinned explicitly rather than inherited from the prebuilt '
+            'C library\'s DEFAULT_SYNCHRONOUS / DEFAULT_WAL_SYNCHRONOUS');
+  });
+
+  test('WAL checkpoint: enableWal inside a transaction is rejected up front',
+      () async {
+    // Inside a transaction SQLite refuses BOTH halves of enableWal:
+    // `PRAGMA journal_mode=WAL` cannot switch modes, and
+    // `PRAGMA synchronous` answers 'Safety level may not be changed
+    // inside a transaction' (measured). So the call can only verify,
+    // never establish.
+    //
+    // A pooled database is the case that makes the guard necessary: it
+    // is ALREADY in WAL, so the journal-mode statement is a silent no-op
+    // success and the call used to look like it worked while
+    // establishing nothing. On a pool-less database in `delete` mode the
+    // same call failed instead — the same API "succeeding" or failing on
+    // nothing but the journal mode it happened to find. The guard makes
+    // both answer alike, before any pragma runs.
+    final db = await _createTestDb('wal_enable_wal_in_txn.db', readerPoolSize: 2);
+    await _runSql(db, 'CREATE TABLE txn_gate_tbl (id INTEGER PRIMARY KEY)');
+    await db.beginTransaction();
+    await _runSql(db, 'INSERT INTO txn_gate_tbl (id) VALUES (1)');
+
+    await expectLater(
+        db.enableWal(),
+        throwsA(isA<DbasSqliteException>().having((e) => e.code, 'code',
+            DbasSqliteErrorCode.enableWalInsideTransaction)));
+
+    // The rejection is a guard, not damage: the transaction is untouched
+    // and still commits.
+    await db.commit();
+    final stmt = await db.prepareQuery('SELECT COUNT(*) FROM txn_gate_tbl');
+    final rows = await stmt.executeScalar();
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(rows, 1,
+        reason: 'enableWal must reject without disturbing the open '
+            'transaction — the row committed before it was still there');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // executeScript — the multi-statement door
+  //
+  // `prepareQuery` + `DbasSqliteStatement.executeSql` is ONE
+  // `sqlite3_prepare_v2`, one step, one `sqlite3_finalize`, and the C
+  // side passes `pzTail` as a hard `nullptr` — so everything after the
+  // first `;` is discarded with NO error of any kind: the step reports
+  // `SQLITE_DONE` and the caller sees a clean success.
+  //
+  // The damage is not theoretical. A runtime-created table loses every
+  // explicit `CREATE INDEX` that follows it in the same string — a
+  // UNIQUE index therefore enforces nothing — and a
+  // `PRAGMA foreign_keys = ON` written as the last statement of a
+  // four-statement open script never applies at all.
+  //
+  // `executeScript` routes to the C `ExecuteSql` entry point, which is
+  // `sqlite3_exec`: the one path in this library that already loops over
+  // every statement. Nothing splits on `;` in Dart, and nothing may:
+  // `sqlite3_complete` is not exported by the shipped binary, and the
+  // consuming app's DDL carries `CHECK` bodies full of arbitrary user
+  // SQL that a naive split would shred.
+  //
+  // `CREATE INDEX` appeared ZERO times in any `.dart` in this repo
+  // before these tests, and nothing anywhere read `sqlite_master` for
+  // `type='index'`. That gap is why this shipped.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test('executeScript: every statement in the script runs, not just the first',
+      () async {
+    final db = await _createTestDb('script_multi_statement.db');
+
+    // Four statements. Under the prepare path only `CREATE TABLE` would
+    // survive; the index and both rows would vanish silently.
+    await db.executeScript('''
+      CREATE TABLE script_tbl (id INTEGER PRIMARY KEY, code TEXT NOT NULL);
+      CREATE UNIQUE INDEX ux_script_tbl_code ON script_tbl (code);
+      INSERT INTO script_tbl (id, code) VALUES (1, 'a');
+      INSERT INTO script_tbl (id, code) VALUES (2, 'b');
+    ''');
+
+    final tables = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'script_tbl'");
+    // The load-bearing assertion, and the one nothing in this repo made
+    // before: `type='index'`. A dropped tail leaves the TABLE in place,
+    // so a table-only check passes while the schema is silently wrong.
+    final indexes = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ux_script_tbl_code'");
+    final rows = await _queryInt(db, 'SELECT COUNT(*) FROM script_tbl');
+
+    // An index that exists in `sqlite_master` but does not ENFORCE would
+    // be the same bug one layer down, so prove the constraint bites.
+    Object? duplicateError;
+    try {
+      await _runSql(db, "INSERT INTO script_tbl (id, code) VALUES (3, 'a')");
+    } catch (e) {
+      duplicateError = e;
+    }
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(tables, 1, reason: 'statement 1 (CREATE TABLE) must have run');
+    expect(indexes, 1,
+        reason: 'statement 2 (CREATE UNIQUE INDEX) must have run — this is '
+            'the statement the one-prepare/one-step path drops silently, '
+            'and no test in this repo has ever looked for it');
+    expect(rows, 2,
+        reason: 'statements 3 and 4 (both INSERTs) must have run — a script '
+            'stops at nothing but a failure');
+    expect(
+        duplicateError,
+        isA<DbasSqliteException>().having((e) => e.subCategory, 'subCategory',
+            DbasSqliteSubCategory.duplicatedData),
+        reason: 'the UNIQUE index must actually enforce: a CREATE INDEX that '
+            'is recorded but not applied would be the same silent-schema '
+            'bug one layer down');
+  });
+
+  test('executeScript: a trailing PRAGMA foreign_keys = ON actually applies',
+      () async {
+    // The reported production damage, reproduced in its original shape:
+    // `PRAGMA foreign_keys = ON` written as the FOURTH statement of a
+    // four-statement open script. Under the prepare path it is discarded
+    // with the rest of the tail, so every foreign key in the database
+    // silently stops being enforced.
+    final db = await _createTestDb('script_pragma_tail.db');
+
+    await db.executeScript('''
+      CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE fk_child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER NOT NULL REFERENCES fk_parent (id)
+      );
+      INSERT INTO fk_parent (id) VALUES (1);
+      PRAGMA foreign_keys = ON;
+    ''');
+
+    final fkStmt = await db.prepareQuery('PRAGMA foreign_keys');
+    final fkEnabled = await fkStmt.executeScalar();
+    await fkStmt.close();
+
+    Object? orphanError;
+    try {
+      await _runSql(db, 'INSERT INTO fk_child (id, parent_id) VALUES (1, 99)');
+    } catch (e) {
+      orphanError = e;
+    }
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(fkEnabled, 1,
+        reason: 'the 4th statement of the script must have applied — a '
+            'dropped tail leaves foreign_keys at its default 0 and the '
+            'readback is the only way to see it');
+    expect(
+        orphanError,
+        isA<DbasSqliteException>().having((e) => e.subCategory, 'subCategory',
+            DbasSqliteSubCategory.foreignKeyViolation),
+        reason: 'foreign_keys=ON must be in force, not merely recorded: an '
+            'orphan child row has to be rejected');
+  });
+
+  test(
+      'executeScript: the prepare path still drops the tail — the limit executeScript exists for',
+      () async {
+    // A PIN, not a RED. This documents the boundary the new dartdoc on
+    // `prepareQuery` / `DbasSqliteStatement.executeSql` now states out
+    // loud, and it passes before and after `executeScript` lands.
+    //
+    // The silence is the whole hazard: the call below RETURNS NORMALLY.
+    // There is no rc, no exception and no log to notice — the second
+    // statement simply never existed as far as SQLite is concerned.
+    final db = await _createTestDb('script_prepare_path_limit.db');
+
+    await _runSql(db, '''
+      CREATE TABLE limit_tbl (id INTEGER PRIMARY KEY);
+      CREATE INDEX ix_limit_tbl_id ON limit_tbl (id);
+    ''');
+
+    final tables = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'limit_tbl'");
+    final indexes = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ix_limit_tbl_id'");
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(tables, 1,
+        reason: 'the FIRST statement runs, which is exactly what makes the '
+            'drop invisible — the caller sees a table and assumes the rest '
+            'landed too');
+    expect(indexes, 0,
+        reason: 'everything after the first ; is discarded by the one-prepare/'
+            'one-step path, silently. If this ever reads 1 the prepare path '
+            'grew multi-statement support and the docs pointing callers at '
+            'executeScript need revisiting');
+  });
+
+  test(
+      'executeScript: a failure stops the script and leaves earlier statements applied',
+      () async {
+    // `sqlite3_exec`'s real contract, and the reason the atomicity
+    // caveat has to be documented: outside a transaction each statement
+    // is its own implicit transaction, so statement 1 is ALREADY
+    // COMMITTED by the time statement 2 fails. There is no rollback to
+    // be had — the failure is not atomic and cannot be made so from
+    // inside this call.
+    final db = await _createTestDb('script_mid_failure.db');
+
+    Object? error;
+    try {
+      await db.executeScript('''
+        CREATE TABLE midfail_kept (id INTEGER PRIMARY KEY);
+        INSERT INTO no_such_table_xyz (id) VALUES (1);
+        CREATE TABLE midfail_never (id INTEGER PRIMARY KEY);
+      ''');
+    } catch (e) {
+      error = e;
+    }
+
+    final kept = await _rowCountOrAbsent(db, 'midfail_kept');
+    final never = await _rowCountOrAbsent(db, 'midfail_never');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(
+        error,
+        isA<DbasSqliteException>()
+            .having((e) => e.code, 'code', DbasSqliteErrorCode.executeScriptFailed)
+            .having((e) => e.category, 'category',
+                DbasSqliteErrorCategory.executeFailed),
+        reason: 'the failure must surface as a DbasSqliteException with its '
+            'own code — silently returning an rc is what this whole change '
+            'exists to stop');
+    expect((error as DbasSqliteException).message, contains('no_such_table_xyz'),
+        reason: 'sqlite3_exec reports WHICH statement failed via errmsg; '
+            'dropping that leaves the caller with a script and no offender');
+    expect(kept, 0,
+        reason: 'statement 1 ran and, in autocommit, is already committed — '
+            'the script is NOT atomic on its own');
+    expect(never, -1,
+        reason: 'the script stops at the first failure: statement 3 must '
+            'never have run');
+  });
+
+  test(
+      'executeScript: wrapping the script in a caller transaction is what makes it atomic',
+      () async {
+    // The documented remedy for the caveat above — and the reason
+    // `executeScript` does NOT copy `vacuum()`'s in-transaction guard.
+    // Rejecting inside a transaction would leave callers with only the
+    // non-atomic mode, i.e. force the very hazard the docs warn about.
+    final db = await _createTestDb('script_txn_atomic.db');
+    await db.beginTransaction();
+
+    Object? error;
+    try {
+      await db.executeScript('''
+        CREATE TABLE txnfail_tbl (id INTEGER PRIMARY KEY);
+        INSERT INTO no_such_table_xyz (id) VALUES (1);
+      ''');
+    } catch (e) {
+      error = e;
+    }
+    await db.rollback();
+
+    final kept = await _rowCountOrAbsent(db, 'txnfail_tbl');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(error, isA<DbasSqliteException>(),
+        reason: 'the script must still fail the same way inside a '
+            'transaction');
+    expect(kept, -1,
+        reason: 'statement 1 must be GONE. Inside the caller\'s transaction '
+            'there is no implicit per-statement commit, so the rollback '
+            'takes the CREATE TABLE with it — this is the only way to get '
+            'all-or-nothing out of a script');
+  });
+
+  test('executeScript: runs inside a transaction without deadlocking on the writer lock',
+      () async {
+    // `beginTransaction` holds the writer lock for the transaction's
+    // whole lifetime and the queue is FIFO, so a naive
+    // `_acquireWriterLock()` here would queue behind ITSELF and park for
+    // the full `kWriterLockWaitTimeoutMs`. `executeScript` must register
+    // as a reentrant writer user instead, exactly as
+    // `DbasSqliteStatement.executeSql` does.
+    //
+    // The commit below is the second half of the proof: a reentrant
+    // registration that is never released would make `commit()` throw
+    // `commitBlockedByInFlightOperation` instead.
+    final db = await _createTestDb('script_in_transaction.db');
+    DbasSqlite.debugWriterLockWaitTimeoutMs = 2000;
+    addTearDown(() => DbasSqlite.debugWriterLockWaitTimeoutMs = null);
+
+    await db.beginTransaction();
+    await db.executeScript('''
+      CREATE TABLE txn_script_tbl (id INTEGER PRIMARY KEY, code TEXT);
+      CREATE UNIQUE INDEX ux_txn_script_code ON txn_script_tbl (code);
+      INSERT INTO txn_script_tbl (id, code) VALUES (1, 'x');
+    ''');
+    await db.commit();
+
+    final indexes = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ux_txn_script_code'");
+    final rows = await _queryInt(db, 'SELECT COUNT(*) FROM txn_script_tbl');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(indexes, 1,
+        reason: 'the whole script must have run inside the transaction and '
+            'survived the commit');
+    expect(rows, 1, reason: 'the INSERT in the script must have committed');
+  });
+
+  test('executeScript: returns affected rows and discards result rows',
+      () async {
+    // Two contracts in one measurement, because they share a script:
+    //   - affected rows come from the CONNECTION-scoped accessor
+    //     (`sqlite3_changes64`), which is what the C header says exists
+    //     for `ExecuteSql` callers — no stmt handle exists in that flow;
+    //   - `sqlite3_exec` is called with a nullptr callback, so the
+    //     trailing SELECT's rows go nowhere. It must not throw, and it
+    //     must not disturb the change counter either.
+    final db = await _createTestDb('script_affected_rows.db');
+    await _runSql(db, 'CREATE TABLE affected_tbl (id INTEGER PRIMARY KEY)');
+
+    final affected = await db.executeScript('''
+      INSERT INTO affected_tbl (id) VALUES (1);
+      INSERT INTO affected_tbl (id) VALUES (2);
+      INSERT INTO affected_tbl (id) VALUES (3);
+      DELETE FROM affected_tbl WHERE id > 1;
+      SELECT * FROM affected_tbl;
+    ''');
+    final remaining = await _queryInt(db, 'SELECT COUNT(*) FROM affected_tbl');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(affected, 2,
+        reason: 'the count belongs to the last ROW-CHANGING statement (the '
+            'DELETE removed 2), not to the script as a whole and not to the '
+            'trailing SELECT');
+    expect(remaining, 1,
+        reason: 'the DELETE really ran — the returned count is not a number '
+            'invented by the wrapper');
+  });
+
+  test('executeScript: rejects when the database is not opened', () async {
+    final db = await DbasSqlite.getInstance(dbName: 'script_not_opened.db');
+    await db.dropDb();
+
+    await expectLater(
+        db.executeScript('CREATE TABLE never_tbl (id INTEGER PRIMARY KEY)'),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.executeScriptDatabaseNotOpened)
+            .having((e) => e.category, 'category',
+                DbasSqliteErrorCategory.notOpened)));
+  });
 }
