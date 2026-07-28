@@ -55,6 +55,103 @@ Future<void> _awaitReaderWaiters(DbasSqlite db, int count,
       reason: 'expected at least $count parked reader-slot waiter(s)');
 }
 
+/// Pumps the event loop until [count] callers have parked in the
+/// writer-lock wait queue (or [maxYields] is exhausted). Mirrors
+/// [_awaitReaderWaiters]'s rationale — a caller only reaches the queue
+/// after its own `await` chain has been scheduled, so a single
+/// `Future.delayed(Duration.zero)` is not guaranteed to be enough.
+Future<void> _awaitWriterWaiters(DbasSqlite db, int count,
+    {int maxYields = 1000}) async {
+  for (var i = 0;
+      i < maxYields && db.debugWriterLockWaitQueueLength < count;
+      i++) {
+    await Future<void>.delayed(Duration.zero);
+  }
+  expect(db.debugWriterLockWaitQueueLength, greaterThanOrEqualTo(count),
+      reason: 'expected at least $count parked writer-lock waiter(s)');
+}
+
+// ── WAL-checkpoint probes ─────────────────────────────────────────────
+//
+// The only assertion that actually proves committed data reached the
+// main `.db` file is "rows visible in a main-file-only copy": copy the
+// `.db` WITHOUT its `-wal`/`-shm` and open the copy. Frames that were
+// never folded out of the WAL live only in the `-wal`, so the copy is
+// short — or has no table at all — until a checkpoint runs. File sizes
+// are a useful secondary signal, never the proof.
+
+/// Runs [sql] and returns the first column of the first row as an int,
+/// or `-1` when the query produced no rows.
+Future<int> _queryInt(DbasSqlite db, String sql) async {
+  final stmt = await db.prepareQuery(sql);
+  try {
+    final reader = await stmt.executeReader();
+    try {
+      if (!await reader.readRow()) return -1;
+      return reader.getColumnInt(0);
+    } finally {
+      await reader.close();
+    }
+  } finally {
+    await stmt.close();
+  }
+}
+
+/// Rows in [table] (optionally narrowed by [where]), or `-1` when
+/// [table] is absent from the schema entirely. Never throws for a
+/// missing table, so an unfolded WAL shows up as a readable row-count
+/// mismatch instead of a `no such table` crash that hides which of the
+/// two failure modes happened.
+Future<int> _rowCountOrAbsent(DbasSqlite db, String table,
+    {String? where}) async {
+  final present = await _queryInt(db,
+      "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '$table'");
+  if (present < 1) return -1;
+  final filter = where == null ? '' : ' WHERE $where';
+  return await _queryInt(db, 'SELECT COUNT(*) FROM $table$filter');
+}
+
+/// Byte sizes of the main `.db` and its `-wal`, formatted for `reason:`
+/// strings. `-1` means the file does not exist.
+Future<String> _walFootprint(DbasSqlite db) async {
+  final base = await db.getAppDatabasePath();
+  Future<int> len(String suffix) async {
+    final f = File('$base$suffix');
+    return await f.exists() ? await f.length() : -1;
+  }
+
+  return 'main=${await len('')}B, wal=${await len('-wal')}B';
+}
+
+/// Copies ONLY the main `.db` file of [db] — deliberately leaving the
+/// `-wal` and `-shm` behind — into [probeDbName], opens the copy, and
+/// returns [_rowCountOrAbsent] for [table] there. The copy is dropped
+/// before returning, so the same [probeDbName] can be reused.
+///
+/// [db] may be open or closed; only the resolved path is used.
+Future<int> _rowsInMainFileOnly(
+    DbasSqlite db, String table, String probeDbName,
+    {String? where}) async {
+  final srcPath = await db.getAppDatabasePath();
+  final probe = await DbasSqlite.getInstance(dbName: probeDbName);
+  final probePath = await probe.getAppDatabasePath();
+  // A stale foreign `-wal` beside a copied `.db` opens with NO error and
+  // silently serves the OTHER database's rows, so clear all three first.
+  for (final suffix in const ['', '-wal', '-shm']) {
+    final f = File('$probePath$suffix');
+    if (await f.exists()) await f.delete();
+  }
+  await File(srcPath).copy(probePath);
+
+  await probe.openDb(readerPoolSize: 0);
+  try {
+    return await _rowCountOrAbsent(probe, table, where: where);
+  } finally {
+    await probe.closeDb();
+    await probe.dropDb();
+  }
+}
+
 void main() async {
   setUpAll(() async {
     // Clean test database directory before all tests
@@ -1983,6 +2080,516 @@ void main() async {
     await db.rollback();
     expect(db.isInTransaction, isFalse);
 
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Transaction: lock ownership — commit() pre-flight
+  // ──────────────────────────────────────────────────────────────────────
+
+  test('commit() rejects an in-flight reentrant executeSql instead of racing it',
+      () async {
+    // beginTransaction() is idempotent, so a second caller that joined an
+    // already-active transaction never acquires the writer lock itself.
+    // If THAT caller's commit() runs while the real owner still has an
+    // executeSql mid prepare / bind / step / finalize dispatch, the
+    // owner's still-running FFI work keeps using the writer connection
+    // after COMMIT already ended the transaction and handed the lock to
+    // the next FIFO waiter. commit() must refuse instead of racing it.
+    final db = await _createTestDb('commit_preflight_inflight_write.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+
+    await db.beginTransaction();
+    final stmt = await db.prepareQuery("INSERT INTO t (id, val) VALUES (1, 'x')");
+    // Deliberately NOT awaited — still mid prepare/bind/step/finalize
+    // dispatch when commit() is invoked on the very next line. No
+    // `Future.delayed` guess needed: `executeSql()`'s synchronous prefix
+    // (which is where the reentrant registration happens) runs to
+    // completion before this statement returns control, and
+    // `expectLater`/`throwsA` synchronously invokes the `() => db.commit()`
+    // closure to obtain its Future — the same established idiom as
+    // 'transaction() helper rolls back on error and rethrows'.
+    final writeFuture = stmt.executeSql();
+
+    await expectLater(
+      () => db.commit(),
+      throwsA(isA<DbasSqliteException>().having((e) => e.code, 'code',
+          DbasSqliteErrorCode.commitBlockedByInFlightOperation)),
+    );
+    expect(db.isInTransaction, isTrue,
+        reason: 'a rejected pre-flight must not touch transaction state');
+
+    // Awaiting the write clears the blocker; the same commit then works.
+    await writeFuture;
+    await db.commit();
+    expect(db.isInTransaction, isFalse);
+
+    final v = await (await db.prepareQuery('SELECT val FROM t WHERE id = 1'))
+        .executeScalar();
+    expect(v, 'x');
+
+    await stmt.close();
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('commit() rejects a still-open in-transaction reader routed to the writer',
+      () async {
+    // A reader opened after a write in the same transaction is routed to
+    // the writer connection for read-your-writes. Committing while its
+    // cursor is still live leaves that cursor running on a connection
+    // whose transaction has ended and whose writer lock has been handed
+    // on. commit() must refuse until the reader is closed or exhausted.
+    final db = await _createTestDb('commit_preflight_open_reader.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+
+    await db.beginTransaction();
+    await _runSql(db, "INSERT INTO t VALUES (1, 'x')"); // flips routing to writer
+    final readStmt = await db.prepareQuery('SELECT val FROM t WHERE id = 1');
+    final reader = await readStmt.executeReader(); // left open on purpose
+    expect(await reader.readRow(), isTrue);
+
+    await expectLater(
+      () => db.commit(),
+      throwsA(isA<DbasSqliteException>().having((e) => e.code, 'code',
+          DbasSqliteErrorCode.commitBlockedByActiveReader)),
+    );
+    expect(db.isInTransaction, isTrue,
+        reason: 'a rejected pre-flight must not touch transaction state');
+
+    await reader.close();
+    await db.commit();
+    expect(db.isInTransaction, isFalse);
+
+    await readStmt.close();
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('commit() pre-flight does not block an unrelated pool reader', () async {
+    // Blast-radius proof for the pre-flight check: it must fire ONLY for
+    // users of the writer connection. A reader opened outside any
+    // transaction runs on its own pool connection, and a WAL pool read
+    // never blocks a writer COMMIT — so leaving one open must not make
+    // an unrelated transaction's commit() throw.
+    final db = await _createTestDb('commit_preflight_pool_reader_unaffected.db',
+        readerPoolSize: 2);
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+    await _runSql(db, "INSERT INTO t VALUES (1, 'a')");
+
+    // Opened OUTSIDE any transaction — a pool connection, independent of
+    // the writer. Left open on purpose.
+    final poolStmt = await db.prepareQuery('SELECT val FROM t WHERE id = 1');
+    final poolReader = await poolStmt.executeReader();
+    expect(await poolReader.readRow(), isTrue);
+
+    await db.beginTransaction();
+    await _runSql(db, "INSERT INTO t VALUES (2, 'b')");
+    await db.commit(); // must NOT throw — WAL pool reads never block COMMIT
+    expect(db.isInTransaction, isFalse);
+
+    await poolReader.close();
+    await poolStmt.close();
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('a nested beginTransaction/commit pair still ends the WHOLE transaction (no reference counting, unchanged)',
+      () async {
+    // Regression pin for the part of the design this fix does NOT
+    // change. DbasSqlite tracks at most one active transaction with no
+    // reference counting, so a joiner's commit() ends the transaction
+    // for everyone. The fix only guards against RACING in-flight work —
+    // it must not turn nested begin/commit into a reference count, or
+    // 'beginTransaction is idempotent when already in transaction'
+    // (2 begins + 1 commit → isInTransaction == false) would break.
+    final db = await _createTestDb('nested_commit_ends_outer.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+
+    await db.beginTransaction(); // "outer" — the real owner
+    expect(db.startedCurrentTransaction, isTrue);
+    await db.beginTransaction(); // "inner" — idempotent join, no new lock hold
+    expect(db.startedCurrentTransaction, isFalse);
+
+    await db.commit(); // ends the WHOLE transaction — by design, no refcounting
+    expect(db.isInTransaction, isFalse);
+
+    // A write issued after this point is no longer transactional with
+    // anything — it lands autocommitted. This is the documented,
+    // accepted consequence of the non-refcounted design.
+    await _runSql(db, 'INSERT INTO t (id) VALUES (1)');
+    final count = await (await db.prepareQuery('SELECT COUNT(*) FROM t'))
+        .executeScalar();
+    expect(count, 1);
+
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('a stale reentrant-op decrement must not cancel a live registration from a later transaction',
+      () async {
+    // The reentrant-op count is what commit()'s pre-flight consults, so
+    // an unbalanced decrement silently disarms it. A decrement CAN
+    // arrive after its own transaction ended: rollback() deliberately
+    // has no pre-flight check (see 'rollback() does NOT
+    // pre-flight-block …'), so it can end a transaction while an
+    // executeSql dispatched inside it is still in flight; that
+    // dispatch's unregistration then lands later, against whatever
+    // transaction is current by then.
+    //
+    // Treating such a late decrement as a plain "clamp at zero" no-op is
+    // only safe while the NEXT transaction has no reentrant op of its
+    // own. With the counter at 1, the stale decrement drops it to 0 —
+    // cancelling a live registration and letting a commit() straight
+    // through a pre-flight that should have blocked it. The registration
+    // must therefore be identified (generation/epoch tag), not merely
+    // counted.
+    //
+    // Driven through the reentrant hooks rather than real in-flight SQL
+    // because the ordering this pins — stale decrement lands AFTER the
+    // next transaction's registration but BEFORE its commit() — is not
+    // expressible deterministically through worker-isolate dispatch;
+    // there is no seam to stall a worker mid-dispatch.
+    final db = await _createTestDb('stale_reentrant_decrement.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+
+    // Transaction 1 registers a reentrant op, then ends WITHOUT it
+    // having finished — exactly what rollback() permits.
+    await db.beginTransaction();
+    final staleOp = db.beginReentrantWriterOpInternal();
+    await db.rollback();
+    expect(db.isInTransaction, isFalse);
+
+    // Transaction 2 starts and registers its OWN, genuinely live op.
+    await db.beginTransaction();
+    final liveOp = db.beginReentrantWriterOpInternal();
+
+    // Transaction 1's decrement finally lands — late, and against a
+    // transaction that no longer exists. It must be a no-op.
+    db.endReentrantWriterOpInternal(staleOp);
+
+    // ...and must NOT have cancelled transaction 2's live registration.
+    await expectLater(
+      () => db.commit(),
+      throwsA(isA<DbasSqliteException>().having((e) => e.code, 'code',
+          DbasSqliteErrorCode.commitBlockedByInFlightOperation)),
+    );
+    expect(db.isInTransaction, isTrue);
+
+    // Once the real op ends, the same commit goes through.
+    await _runSql(db, 'INSERT INTO t (id) VALUES (1)');
+    db.endReentrantWriterOpInternal(liveOp);
+    await db.commit();
+    expect(db.isInTransaction, isFalse);
+
+    final count = await (await db.prepareQuery('SELECT COUNT(*) FROM t'))
+        .executeScalar();
+    expect(count, 1);
+
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Transaction: strict mode (opt-in real serialization)
+  // ──────────────────────────────────────────────────────────────────────
+
+  test('beginTransaction(strict: true) parks instead of silently joining',
+      () async {
+    final db = await _createTestDb('strict_mode_parks.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+
+    await db.beginTransaction();
+    expect(db.isInTransaction, isTrue);
+    expect(db.startedCurrentTransaction, isTrue);
+
+    final strictBegin = db.beginTransaction(strict: true);
+    await _awaitWriterWaiters(db, 1);
+
+    // The owner's transaction is still the active one — proof the
+    // strict caller really parked rather than collapsing into it.
+    expect(db.isInTransaction, isTrue);
+
+    await _runSql(db, "INSERT INTO t VALUES (1, 'owner-write')");
+    await db.commit(); // hands the writer lock to the parked strict caller
+
+    await strictBegin; // resolves — strict caller has ITS OWN transaction
+    expect(db.isInTransaction, isTrue);
+    expect(db.startedCurrentTransaction, isTrue,
+        reason: 'strict mode never joins — it always starts fresh');
+
+    await _runSql(db, "INSERT INTO t VALUES (2, 'strict-write')");
+    await db.commit();
+
+    final count = await (await db.prepareQuery('SELECT COUNT(*) FROM t'))
+        .executeScalar();
+    expect(count, 2);
+
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('beginTransaction(strict: true) behaves like default when uncontended',
+      () async {
+    final db = await _createTestDb('strict_mode_no_contention.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+
+    await db.beginTransaction(strict: true);
+    expect(db.isInTransaction, isTrue);
+    expect(db.startedCurrentTransaction, isTrue);
+    expect(db.debugWriterLockWaitQueueLength, 0);
+
+    await db.commit();
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('startedCurrentTransaction reports false when beginTransaction joins',
+      () async {
+    final db = await _createTestDb('started_current_transaction.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+
+    await db.beginTransaction();
+    expect(db.startedCurrentTransaction, isTrue);
+    await db.beginTransaction(); // idempotent no-op join
+    expect(db.startedCurrentTransaction, isFalse);
+    await db.commit();
+    expect(db.startedCurrentTransaction, isFalse,
+        reason: 'resets once the transaction ends');
+
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('beginTransaction(strict: true) from the flow that already owns the transaction fails instead of deadlocking',
+      () async {
+    // Strict mode never joins — it parks on the writer-lock queue. When
+    // the caller IS the current owner, nobody will ever release that
+    // lock, so the call parks forever: no timeout, no detection, no
+    // error code, and `isInTransaction` keeps reporting `true` while the
+    // flow is wedged. A self-deadlock must surface as a diagnosable
+    // typed error, mirroring the reader slot's existing wait timeout
+    // (DbasSqliteErrorCode.readerSlotWaitTimeout, exercised by
+    // 'pool: blocking-acquire times out when readers are saturated').
+    final db = await _createTestDb('strict_mode_self_deadlock.db');
+    // Test-only override, same rationale and lifecycle as
+    // debugPoolAcquireTimeoutMs: shorten the wait so the test completes
+    // in milliseconds instead of the production deadline.
+    DbasSqlite.debugWriterLockWaitTimeoutMs = 200;
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+
+      await db.beginTransaction();
+      expect(db.isInTransaction, isTrue);
+
+      // The `.timeout` is a REGRESSION GUARD, not the assertion: without
+      // it, a library that still parks forever would hang the whole
+      // suite instead of failing this test. It is deliberately an order
+      // of magnitude longer than the override above, so it can only fire
+      // when the library never timed out at all.
+      await expectLater(
+        db.beginTransaction(strict: true).timeout(const Duration(seconds: 5)),
+        throwsA(isA<DbasSqliteException>().having((e) => e.code, 'code',
+            DbasSqliteErrorCode.writerLockWaitTimeout)),
+      );
+
+      // A strict acquire that gave up must leave the transaction it
+      // could not join completely untouched, and must not leak its
+      // abandoned waiter into the queue.
+      expect(db.isInTransaction, isTrue);
+      expect(db.debugWriterLockWaitQueueLength, 0,
+          reason: 'a timed-out waiter must remove itself from the queue');
+
+      await _runSql(db, 'INSERT INTO t (id) VALUES (1)');
+      await db.commit();
+      expect(db.isInTransaction, isFalse);
+
+      final count = await (await db.prepareQuery('SELECT COUNT(*) FROM t'))
+          .executeScalar();
+      expect(count, 1);
+    } finally {
+      DbasSqlite.debugWriterLockWaitTimeoutMs = null;
+      await db.closeDb();
+      await db.dropDb();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Transaction: commit failure recovery
+  // ──────────────────────────────────────────────────────────────────────
+
+  test('commit(): a genuine COMMIT failure alone still rethrows commitFailed (rollback recovers)',
+      () async {
+    final db = await _createTestDb('commit_failure_recovers.db');
+    await _runSql(db, 'PRAGMA foreign_keys = ON');
+    await _runSql(db, 'CREATE TABLE parent (id INTEGER PRIMARY KEY)');
+    await _runSql(db,
+        'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))');
+
+    await db.beginTransaction();
+    await _runSql(db, 'PRAGMA defer_foreign_keys = ON');
+    // No row 999 in `parent` — deferred, so this INSERT itself succeeds;
+    // per sqlite.org/foreignkeys.html the transaction "remains open" on
+    // a deferred-FK COMMIT failure (SQLite does NOT auto-rollback), so
+    // this is a real, deterministic way to trigger `commitFailed`
+    // without a mock, and to reach `rollback()` as a genuine recovery
+    // afterwards.
+    await _runSql(db, 'INSERT INTO child (id, parent_id) VALUES (1, 999)');
+
+    // Verified empirically against the bundled SQLite build: a
+    // deferred-FK COMMIT failure populates the extended rc exactly like
+    // an immediate one, so SQLITE_CONSTRAINT (19) / 787 /
+    // foreignKeyViolation all hold — the same triple the immediate-FK
+    // test 'FOREIGN KEY violation surfaces
+    // DbasSqliteSubCategory.foreignKeyViolation' pins on the step path.
+    await expectLater(
+      () => db.commit(),
+      throwsA(isA<DbasSqliteException>()
+          .having((e) => e.code, 'code', DbasSqliteErrorCode.commitFailed)
+          .having((e) => e.sqliteCode, 'sqliteCode', 19)
+          .having((e) => e.sqliteUniqueCode, 'sqliteUniqueCode', 787)
+          .having((e) => e.subCategory, 'subCategory',
+              DbasSqliteSubCategory.foreignKeyViolation)),
+    );
+
+    expect(db.isInTransaction, isFalse,
+        reason: 'the automatic rollback() recovery succeeded');
+    final count = await (await db.prepareQuery('SELECT COUNT(*) FROM child'))
+        .executeScalar();
+    expect(count, 0, reason: 'the deferred-violation insert was rolled back');
+
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test('rollback() does NOT pre-flight-block on an open writer-routed reader (unlike commit)',
+      () async {
+    // Scoping pin for the pre-flight check: it belongs to commit() only.
+    // SQLite tolerates a ROLLBACK with live statements on the connection
+    // (unlike COMMIT, which fails with SQLITE_BUSY), and rollback() is
+    // the best-effort cleanup path used by closeDb() and by error
+    // recovery throughout DbasSqlite — adding a new way for it to fail
+    // would be a regression, not a safety improvement.
+    final db = await _createTestDb('rollback_no_preflight.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+
+    await db.beginTransaction();
+    await _runSql(db, "INSERT INTO t VALUES (1, 'x')"); // flips routing to writer
+    final readStmt = await db.prepareQuery('SELECT val FROM t WHERE id = 1');
+    final reader = await readStmt.executeReader(); // left open on purpose
+
+    await db.rollback(); // must NOT throw — see rollback()'s doc comment
+    expect(db.isInTransaction, isFalse);
+
+    if (!reader.isClosed) await reader.close();
+    await readStmt.close();
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Transaction: rollback() vs. an in-flight write
+  // ──────────────────────────────────────────────────────────────────────
+
+  test('rollback() must not leave a raced in-flight write permanently persisted',
+      () async {
+    // The complement of 'rollback() does NOT pre-flight-block on an open
+    // writer-routed reader (unlike commit)' directly above, and it does
+    // NOT contradict it: READERS stay deliberately un-gated (a live
+    // cursor only ever observes data the ROLLBACK is about to undo), but
+    // an in-flight WRITE is a different animal — it can outlive the
+    // ROLLBACK and land in autocommit.
+    //
+    // `executeSql` replays its bind buffer one bind at a time, and every
+    // single bind is its own await / worker round-trip. A write
+    // dispatched un-awaited inside an open transaction is therefore
+    // still walking a long chain of pending dispatches when rollback()
+    // runs on the next line. rollback() issues ROLLBACK immediately (no
+    // pre-flight, by design), the ROLLBACK slips BETWEEN two of the
+    // write's bind dispatches, and the statement's step then executes on
+    // a connection that is back in autocommit mode. The row is committed
+    // on its own and SURVIVES the rollback — silently, with no error
+    // raised on either side.
+    //
+    // rollback() must therefore DRAIN in-flight writer operations before
+    // issuing ROLLBACK — wait for them, never reject them. Draining
+    // rather than throwing is deliberate: rollback() is closeDb()'s
+    // cleanup path and the error-recovery path throughout DbasSqlite, so
+    // a new failure mode on teardown would be a regression — which is
+    // precisely what the neighbouring test above pins.
+    final db = await _createTestDb('rollback_drains_inflight_write.db');
+    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+
+    // LOAD-BEARING — DO NOT "simplify" this to a small bind count.
+    // `executeSql` crosses a prepare dispatch, then one dispatch PER
+    // BIND, then a step and a finalize dispatch before the row actually
+    // lands; ROLLBACK only has to slip into ONE of those gaps. Measured
+    // against this library, the race reproduces 100% of the time at 2,
+    // 11, 51, 101, 201, 301 and 401 binds — so today the width is a
+    // safety MARGIN, not a threshold, and this number is deliberately
+    // generous rather than minimal. It is what keeps the test meaningful
+    // if the dispatch chain is ever shortened (batched binds, a fused
+    // prepare+bind+step round-trip): trimmed to the minimum, a
+    // still-broken library could start passing silently.
+    const racingBindCount = 301;
+    // One bind for the primary key, the rest concatenated into the text
+    // column — a single row, but 301 separate bind dispatches to cross.
+    final concatenatedValueBinds =
+        List.filled(racingBindCount - 1, '?').join(' || ');
+    final stmt = await db.prepareQuery(
+        'INSERT INTO t (id, val) VALUES (?, $concatenatedValueBinds)');
+    final racingParams = <Object?>[1, ...List.filled(racingBindCount - 1, 'x')];
+
+    await db.beginTransaction();
+    // Deliberately NOT awaited — the bind chain is still dispatching
+    // when rollback() is invoked below. Same idiom as 'commit() rejects
+    // an in-flight reentrant executeSql instead of racing it'.
+    final writeFuture = stmt.executeSql(params: racingParams);
+
+    // The outcome recorder is attached IMMEDIATELY (synchronously, so it
+    // cannot perturb the race) rather than at the later await: an error
+    // arriving while rollback() is in flight would otherwise be an
+    // unhandled async error, which flutter_test escalates into a failure
+    // unrelated to what this test pins.
+    //
+    // What the raced write ITSELF does is deliberately NOT pinned. Today
+    // it completes silently — its step lands in autocommit and reports
+    // success. A correct drain may just as legitimately leave it
+    // completing normally against data the ROLLBACK then undoes, or
+    // surface SQLITE_ABORT / executeSqlStepFailed to whoever awaits it.
+    // Both are acceptable; the defect pinned here is the SURVIVING ROW,
+    // not the write's return value. So assert only that it settles, and
+    // carry the observed outcome into the row-count failure message so a
+    // future regression is diagnosable from the output alone.
+    String? writeOutcome;
+    final writeSettled = writeFuture.then<void>((affectedRows) {
+      writeOutcome = 'completed normally (affectedRows=$affectedRows)';
+    }, onError: (Object e) {
+      writeOutcome = 'threw ${e.runtimeType}: $e';
+    });
+
+    // Both `.timeout`s below are REGRESSION GUARDS, not assertions: a
+    // drain written as an unbounded wait on an operation that can never
+    // finish would wedge the entire suite instead of failing this test.
+    // Same stance as 'beginTransaction(strict: true) from the flow that
+    // already owns the transaction fails instead of deadlocking'.
+    await db.rollback().timeout(const Duration(seconds: 30));
+    expect(db.isInTransaction, isFalse);
+
+    await writeSettled.timeout(const Duration(seconds: 30));
+    expect(writeOutcome, isNotNull,
+        reason: 'the raced write must settle, not hang');
+
+    final survivors =
+        await (await db.prepareQuery('SELECT COUNT(*) FROM t')).executeScalar();
+    expect(survivors, 0,
+        reason: 'ROLLBACK must undo the raced write instead of letting it '
+            'autocommit behind the rollback; raced write $writeOutcome');
+    expect(db.isInTransaction, isFalse,
+        reason: 'the drain must not leave the transaction flag set');
+
+    await stmt.close();
     await db.closeDb();
     await db.dropDb();
   });
@@ -5635,6 +6242,67 @@ void main() async {
     expect(wrapped.toString(), contains('cause: Bad state: inner'));
   });
 
+  test('commitRollbackAlsoFailed wraps the original COMMIT failure with cause/rc lifting',
+      () {
+    // Mirrors the `transactionRollbackAlsoFailed` coverage above — the
+    // "both COMMIT and the recovery rollback failed" shape is not
+    // reproducible end-to-end without a mock (this suite has no real,
+    // deterministic way to make a real ROLLBACK fail), so — like
+    // `transactionRollbackAlsoFailed` — only the exception factory's
+    // cause/rc-lifting contract is unit-tested here. What this pins is
+    // that `commit()` must stop SWALLOWING the rollback failure: a
+    // caller has to be able to tell "rollback recovered" (the original
+    // `commitFailed` rethrown, see 'commit(): a genuine COMMIT failure
+    // alone still rethrows commitFailed') apart from "rollback also
+    // failed, state unknown" — which needs its own code, distinct from
+    // `transactionRollbackAlsoFailed` so a bare `commit()` call is
+    // distinguishable from one made through `transaction()`.
+    final originalCommitFailure = DbasSqliteException.sqlite(
+        DbasSqliteErrorCode.commitFailed, 'COMMIT failed: SQLITE_BUSY',
+        sqliteCode: 5);
+    final stack = StackTrace.current;
+    final wrapped = DbasSqliteException.sqlite(
+      DbasSqliteErrorCode.commitRollbackAlsoFailed,
+      'COMMIT failed: $originalCommitFailure. Additionally, rollback also '
+      'failed: Bad state: rollback boom. The database may be in an '
+      'inconsistent state.',
+      sqliteCode: originalCommitFailure.sqliteCode!,
+      cause: originalCommitFailure,
+      causeStackTrace: stack,
+    );
+    expect(wrapped.code, DbasSqliteErrorCode.commitRollbackAlsoFailed);
+    expect(wrapped.category, DbasSqliteErrorCategory.transactionFailed);
+    expect(wrapped.cause, same(originalCommitFailure));
+    expect(wrapped.causeStackTrace, same(stack));
+    expect(wrapped.sqliteCode, 5);
+    expect(wrapped.toString(), contains('commitRollbackAlsoFailed'));
+  });
+
+  test('the new transaction-ownership error codes map to the documented categories',
+      () {
+    // `category` is an exhaustive switch with no `default`, so a new
+    // enum value that nobody classified is a hard analyzer error rather
+    // than a silent fallthrough. These pin the intended grouping:
+    // `commitDatabaseNotOpened` joins the sibling "you called this on a
+    // closed database" guards, the two `commitBlockedBy*` codes and
+    // `commitRollbackAlsoFailed` join the sibling
+    // `transactionAlreadyActive` / `vacuumInsideTransaction` "wrong time
+    // to call this transaction operation" group (even though
+    // `commitBlockedByActiveReader`'s root cause is reader-lifecycle),
+    // and `writerLockWaitTimeout` mirrors its reader-side twin
+    // `readerSlotWaitTimeout`.
+    expect(DbasSqliteErrorCode.commitDatabaseNotOpened.category,
+        DbasSqliteErrorCategory.notOpened);
+    expect(DbasSqliteErrorCode.commitBlockedByInFlightOperation.category,
+        DbasSqliteErrorCategory.transactionFailed);
+    expect(DbasSqliteErrorCode.commitBlockedByActiveReader.category,
+        DbasSqliteErrorCategory.transactionFailed);
+    expect(DbasSqliteErrorCode.commitRollbackAlsoFailed.category,
+        DbasSqliteErrorCategory.transactionFailed);
+    expect(DbasSqliteErrorCode.writerLockWaitTimeout.category,
+        DbasSqliteErrorCategory.busyOrCancelled);
+  });
+
   // The .sqlite factory asserts that sqliteUniqueCode is only set when
   // sqliteCode is also set. A future maintainer who accidentally
   // populates only the extended slot should hit this assertion in
@@ -5878,4 +6546,874 @@ void main() async {
   // (No direct test — _workerErrorFromJsError is private to web_pool.dart
   // and runs only on web. The behaviour is verified by web integration
   // tests; the helper's contract is documented in its dartdoc.)
+
+  // ──────────────────────────────────────────────────────────────────────
+  // WAL checkpoint — committed data must reach the main `.db` file
+  //
+  // A pooled open (`readerPoolSize >= 1`, the `openDb()` default and the
+  // production configuration) puts the database in `journal_mode=wal`.
+  // Dart then issues no pragmas of its own, so SQLite's stock
+  // `wal_autocheckpoint=1000` is inherited and committed frames pile up
+  // in the `-wal` indefinitely — measured: 200 committed inserts leave
+  // the main `.db` at 4096 bytes with an 832 KB `-wal`, and the table is
+  // not in the main file AT ALL. Anything that reads the main `.db`
+  // alone — a file copy, a backup, `streamCopyDb`, the consumer's
+  // `copyDatabase` — then sees a truncated or entirely empty database,
+  // with no error of any kind.
+  //
+  // Spec: a checkpoint happens AUTOMATICALLY on
+  //   1. commit,
+  //   2. closeDb — rolling back any open transaction FIRST, because a
+  //      checkpoint issued inside an open transaction is a silent no-op,
+  //   3. any insert/update/delete outside a transaction.
+  // (1) and (3) are one mechanism: bare DML is an implicit transaction
+  // that commits.
+  //
+  // Every assertion below is "rows visible in a main-file-only copy",
+  // the only signal that actually proves frames left the WAL. `-1` in a
+  // failure message means the table never reached the main file at all.
+  // File sizes appear in `reason:` strings as a secondary diagnostic.
+  //
+  // `readerPoolSize: 0` is deliberately NOT used here: that path opens
+  // in `journal_mode=delete`, where there is no WAL and nothing to
+  // checkpoint, so it cannot exercise this behaviour at all.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test(
+      'WAL checkpoint: bare DML outside a transaction folds into the main db file',
+      () async {
+    final db = await _createTestDb('wal_bare_dml.db', readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE bare_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    // 200 implicit transactions — comfortably under the stock
+    // `wal_autocheckpoint=1000` frame threshold, so nothing folds by
+    // accident and the assertion measures the intended mechanism only.
+    for (var i = 1; i <= 200; i++) {
+      await _runSql(db, 'INSERT INTO bare_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'row$i']);
+    }
+
+    final footprint = await _walFootprint(db);
+    final rows =
+        await _rowsInMainFileOnly(db, 'bare_tbl', 'wal_bare_dml_probe.db');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(rows, 200,
+        reason: 'each insert outside a transaction is an implicit '
+            'transaction that commits, so all 200 rows must live in the main '
+            '.db file and survive a main-file-only copy. Source footprint at '
+            'copy time: $footprint');
+  });
+
+  test('WAL checkpoint: commit() folds each transaction into the main db file',
+      () async {
+    final db = await _createTestDb('wal_commit.db', readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE commit_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+
+    var written = 0;
+    final observed = <int>[];
+    final expected = <int>[];
+    final footprints = <String>[];
+    for (var txn = 1; txn <= 5; txn++) {
+      await db.beginTransaction();
+      for (var i = 0; i < 20; i++) {
+        written++;
+        await _runSql(db, 'INSERT INTO commit_tbl (id, val) VALUES (?, ?)',
+            params: [written, 'v$written']);
+      }
+      await db.commit();
+
+      footprints.add('after commit #$txn: ${await _walFootprint(db)}');
+      observed.add(
+          await _rowsInMainFileOnly(db, 'commit_tbl', 'wal_commit_probe.db'));
+      expected.add(written);
+    }
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(observed, expected,
+        reason: 'after every commit the main .db file must already hold every '
+            'row committed so far, so the running totals must track '
+            '$expected. Source footprints: ${footprints.join(' | ')}');
+  });
+
+  test('WAL checkpoint: closeDb folds even when it is NOT the last connection',
+      () async {
+    // `closeDb` performs no checkpoint of its own on either teardown
+    // path — the pool path calls `closePool`, the single-connection path
+    // hardcodes `checkpoint: false`. What makes the default case look
+    // healthy is SQLite itself: closing the LAST connection to a WAL
+    // database checkpoints implicitly. Keep one other connection alive
+    // and that safety net disappears.
+    //
+    // Two `DbasSqlite` instances over one physical database give exactly
+    // that: instances are keyed by `dbName`, but `getAppDatabasePath`
+    // concatenates the name onto the directory, so 'x.db' and './x.db'
+    // are two independent instances — two real SQLite connections —
+    // resolving to a single file. That is precisely the situation any
+    // second opener of the same database file creates.
+    const writerName = 'wal_close_nonlast.db';
+    const holderName = './wal_close_nonlast.db';
+
+    final writer = await _createTestDb(writerName, readerPoolSize: 4);
+    await _runSql(
+        writer, 'CREATE TABLE nonlast_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+
+    final holder = await DbasSqlite.getInstance(dbName: holderName);
+    await holder.openDb(readerPoolSize: 0);
+    expect(holder.isOpened(), isTrue,
+        reason: 'the second connection must really be open, otherwise this '
+            'test degenerates into the last-connection case that folds by '
+            'itself and proves nothing');
+
+    for (var i = 1; i <= 200; i++) {
+      await _runSql(writer, 'INSERT INTO nonlast_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'row$i']);
+    }
+
+    await writer.closeDb();
+
+    final footprint = await _walFootprint(writer);
+    final rows = await _rowsInMainFileOnly(
+        writer, 'nonlast_tbl', 'wal_nonlast_probe.db');
+
+    // Only ONE dropDb: both instances name the same physical file, and
+    // `dropDb` also tears down the shared per-file native delegate, so a
+    // second call would dereference a delegate that no longer exists.
+    await holder.closeDb();
+    await holder.dropDb();
+
+    expect(rows, 200,
+        reason: 'closeDb must fold the WAL into the main .db file itself, not '
+            'lean on SQLite\'s last-connection auto-checkpoint, so the data '
+            'is durable in the main file even while another connection keeps '
+            'the database open. Footprint after closeDb: $footprint');
+  });
+
+  test(
+      'WAL checkpoint: closeDb with an open transaction rolls back FIRST, then folds',
+      () async {
+    // Same two-connection setup as the previous test, so closeDb has to
+    // do the checkpoint itself rather than inherit SQLite's
+    // last-connection behaviour — that is what makes the ORDER
+    // observable here.
+    const writerName = 'wal_close_open_txn.db';
+    const holderName = './wal_close_open_txn.db';
+
+    final db = await _createTestDb(writerName, readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE close_txn_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 30; i++) {
+      await _runSql(db, 'INSERT INTO close_txn_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'committed$i']);
+    }
+
+    final holder = await DbasSqlite.getInstance(dbName: holderName);
+    await holder.openDb(readerPoolSize: 0);
+    expect(holder.isOpened(), isTrue);
+
+    // Open transaction, deliberately never committed. `closeDb` must
+    // roll it back BEFORE checkpointing: a checkpoint issued while a
+    // transaction is still open is a SILENT no-op — no row, no error,
+    // WAL untouched — so the wrong order would also strand the 30
+    // already-committed rows in the WAL.
+    await db.beginTransaction();
+    for (var i = 1000; i < 1010; i++) {
+      await _runSql(db, 'INSERT INTO close_txn_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'uncommitted$i']);
+    }
+    expect(db.isInTransaction, isTrue);
+
+    await db.closeDb();
+
+    final footprint = await _walFootprint(db);
+    final committed = await _rowsInMainFileOnly(
+        db, 'close_txn_tbl', 'wal_close_txn_probe.db',
+        where: "val LIKE 'committed%'");
+    final uncommitted = await _rowsInMainFileOnly(
+        db, 'close_txn_tbl', 'wal_close_txn_probe.db',
+        where: "val LIKE 'uncommitted%'");
+
+    await holder.closeDb();
+    await holder.dropDb();
+
+    expect(committed, 30,
+        reason: 'rollback must happen BEFORE the checkpoint — a checkpoint '
+            'attempted while the transaction was still open is a silent '
+            'no-op, which would leave these 30 committed rows stranded in '
+            'the WAL. -1 means the table never reached the main file at all. '
+            'Footprint after closeDb: $footprint');
+    expect(uncommitted, 0,
+        reason: 'the open transaction must be rolled back by closeDb, so its '
+            'rows must never reach the main .db file');
+  });
+
+  test('WAL checkpoint: a zero-frame checkpoint is reportable', () async {
+    // NOTE FOR THE FIX: this test is written against an API that does
+    // NOT exist yet and is the one API-shape decision baked into these
+    // frozen tests — `DbasSqlite.checkpoint()`, resolving to the three
+    // values `PRAGMA wal_checkpoint` produces: `busy`, `log` (frames in
+    // the WAL) and `checkpointed` (frames folded into the main file).
+    // The result is used without a type annotation on purpose, so it can
+    // be a record `({int busy, int log, int checkpointed})` or a class
+    // with those three members — whichever the fix prefers.
+    //
+    // Why the library needs it at all: `busy` is NOT a success signal. A
+    // PASSIVE checkpoint that folds nothing reports `busy=0` and returns
+    // SQLITE_OK — measured `[0, 10, 0]` — which is indistinguishable
+    // from a full fold by every signal `executeSql` currently surfaces
+    // (it returns the rc and discards the triple). The only honest test
+    // of "did the data actually reach the main file" is
+    // `checkpointed == log`.
+    final seed = await _createTestDb('wal_checkpoint_report.db',
+        readerPoolSize: 4);
+    await _runSql(
+        seed, 'CREATE TABLE report_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 50; i++) {
+      await _runSql(seed, 'INSERT INTO report_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'seed$i']);
+    }
+    // Close/reopen so the WAL starts empty and the pinned snapshot below
+    // sits at frame 0 — every frame written afterwards is then provably
+    // above it.
+    await seed.closeDb();
+    final db = await DbasSqlite.getInstance(dbName: 'wal_checkpoint_report.db');
+    await db.openDb(readerPoolSize: 4);
+
+    final pinned =
+        await db.prepareQuery('SELECT id FROM report_tbl ORDER BY id');
+    final pinnedReader = await pinned.executeReader();
+    expect(await pinnedReader.readRow(), isTrue);
+
+    for (var i = 100; i < 110; i++) {
+      await _runSql(db, 'INSERT INTO report_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'above$i']);
+    }
+
+    final blocked = await db.checkpoint();
+    expect(blocked.busy, greaterThanOrEqualTo(0),
+        reason: 'the busy flag must be readable, not swallowed');
+    expect(blocked.log, greaterThan(0),
+        reason: 'frames written above the pinned snapshot are still in the WAL');
+    expect(blocked.checkpointed, 0,
+        reason: 'a reader pinned below every one of those frames makes the '
+            'checkpoint fold nothing — that zero MUST be reportable, because '
+            'the checkpoint otherwise looks completely successful');
+    expect(blocked.checkpointed == blocked.log, isFalse,
+        reason: 'checkpointed == log is the real success test; it must be '
+            'false here');
+
+    await pinnedReader.close();
+    await pinned.close();
+
+    final released = await db.checkpoint();
+    expect(released.log, greaterThan(0));
+    expect(released.checkpointed, released.log,
+        reason: 'once the snapshot is released the same frames fold '
+            'completely, and checkpointed == log must say so');
+
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test(
+      'WAL checkpoint: streamCopyDb produces a complete copy of an open database',
+      () async {
+    // `streamCopyDb` copies only the main `.db` and deletes the
+    // destination's `-wal`/`-shm`, so every frame still sitting in the
+    // source WAL is silently dropped from the copy. The existing
+    // "streamCopyDb copies database to new name" test hides this with a
+    // close/reopen dance and the comment "Re-open to ensure WAL is
+    // flushed"; no consumer should have to do that.
+    final src = await _createTestDb('wal_copy_src.db', readerPoolSize: 4);
+    await _runSql(
+        src, 'CREATE TABLE copy_wal_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 200; i++) {
+      await _runSql(src, 'INSERT INTO copy_wal_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'row$i']);
+    }
+
+    await src.streamCopyDb('wal_copy_dest.db');
+    final footprint = await _walFootprint(src);
+
+    final dest = await DbasSqlite.getInstance(dbName: 'wal_copy_dest.db');
+    await dest.openDb(readerPoolSize: 0);
+    final rows = await _rowCountOrAbsent(dest, 'copy_wal_tbl');
+    await dest.closeDb();
+    await dest.dropDb();
+
+    await src.closeDb();
+    await src.dropDb();
+
+    expect(rows, 200,
+        reason: 'streamCopyDb of a live database must yield a complete, '
+            'self-contained copy without any manual close/reopen dance. '
+            'Source footprint at copy time: $footprint');
+  });
+
+  test(
+      'WAL checkpoint: folding must not stall on busy_timeout when a reader holds a snapshot',
+      () async {
+    final db = await _createTestDb('wal_no_stall.db', readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE stall_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 50; i++) {
+      await _runSql(db, 'INSERT INTO stall_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'seed$i']);
+    }
+
+    // Pin a read snapshot on a pool reader and hold it. Frames written
+    // from here on sit ABOVE that snapshot, so no checkpoint can fold
+    // them. Measured on this database: PASSIVE reports the shortfall as
+    // `[0, 10, 0]` in ~0 ms, while TRUNCATE blocks for the whole
+    // busy_timeout — 5034 ms — and then folds exactly the same zero
+    // frames, `[1, 10, 0]`. That is why TRUNCATE must never be used
+    // unconditionally, and why these bounds are assertions rather than
+    // performance notes.
+    final pinned =
+        await db.prepareQuery('SELECT id FROM stall_tbl ORDER BY id');
+    final pinnedReader = await pinned.executeReader();
+    expect(await pinnedReader.readRow(), isTrue);
+
+    final dmlWatch = Stopwatch()..start();
+    for (var i = 100; i < 110; i++) {
+      await _runSql(db, 'INSERT INTO stall_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'above$i']);
+    }
+    dmlWatch.stop();
+
+    final copyWatch = Stopwatch()..start();
+    await db.streamCopyDb('wal_no_stall_copy.db');
+    copyWatch.stop();
+
+    await pinnedReader.close();
+    await pinned.close();
+
+    final copy = await DbasSqlite.getInstance(dbName: 'wal_no_stall_copy.db');
+    await copy.dropDb();
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(dmlWatch.elapsedMilliseconds, lessThan(3000),
+        reason: '10 inserts under a pinned reader snapshot took '
+            '${dmlWatch.elapsedMilliseconds} ms — a per-DML checkpoint must '
+            'give up immediately when frames are pinned, never block on '
+            'busy_timeout (one TRUNCATE alone costs ~5 s here)');
+    expect(copyWatch.elapsedMilliseconds, lessThan(3000),
+        reason: 'streamCopyDb under a pinned reader snapshot took '
+            '${copyWatch.elapsedMilliseconds} ms — it must not block on '
+            'busy_timeout for frames it cannot fold anyway');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Writer connection settings — a pin, not a RED
+  //
+  // This test passes before AND after the change that added
+  // `PRAGMA synchronous=FULL` to the open path: FULL was already the
+  // value. Its job is to fail if the invariant is ever broken — a C
+  // library rebuilt with different flags, a dropped pragma, someone
+  // "simplifying" the open path.
+  //
+  // It pins values that are otherwise INVISIBLE compile-time defaults of
+  // a prebuilt binary. Measured from the shipped library via
+  // `PRAGMA compile_options` (SQLite 3.52.0): `DEFAULT_SYNCHRONOUS=2`,
+  // `DEFAULT_WAL_SYNCHRONOUS=2`, `DEFAULT_WAL_AUTOCHECKPOINT=1000`.
+  // Nothing in the Dart guaranteed the first two, so a future rebuild
+  // could change this database's durability with no code change and no
+  // test failure anywhere. Now a divergence fails loudly, here.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test(
+      'WAL checkpoint: a production-configured writer pins synchronous, wal_autocheckpoint and journal_mode',
+      () async {
+    // `readerPoolSize: 4` is `openDb()`'s OWN default — the production
+    // configuration — not `_createTestDb`'s default of 0. The 0 path
+    // opens in `journal_mode=delete` with no WAL at all, so it cannot
+    // exercise, let alone pin, any of this.
+    final db = await _createTestDb('wal_settings_pin.db', readerPoolSize: 4);
+
+    // The values are read back through the ordinary public API, but they
+    // MUST come off the WRITER connection: `synchronous` and
+    // `wal_autocheckpoint` are per-connection settings and the library
+    // applies them to the writer only. `executeReader` routes to the
+    // writer once the current transaction has performed a write, so the
+    // readback runs inside a transaction whose first statement is one.
+    //
+    // `wal_autocheckpoint == 1` doubles as the WITNESS that the readback
+    // really landed on the writer: a pool reader reports the stock 1000
+    // (measured). Should that routing rule ever change, this assertion
+    // fails loudly instead of quietly pinning `synchronous` — which
+    // reads 2 on every connection — against the wrong one.
+    await _runSql(db, 'CREATE TABLE pin_tbl (id INTEGER PRIMARY KEY)');
+    await db.beginTransaction();
+    await _runSql(db, 'INSERT INTO pin_tbl (id) VALUES (1)');
+
+    Future<Object?> readPragma(String pragma) async {
+      // `executeScalar` closes the reader and the statement itself, so
+      // no cursor is left open across the rollback below.
+      final stmt = await db.prepareQuery('PRAGMA $pragma');
+      return await stmt.executeScalar();
+    }
+
+    final synchronous = await readPragma('synchronous');
+    final autoCheckpoint = await readPragma('wal_autocheckpoint');
+    final journalMode = await readPragma('journal_mode');
+
+    await db.rollback();
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(synchronous, 2,
+        reason: 'the writer must run at synchronous=FULL (2). It is issued '
+            'explicitly at open precisely so it does not depend on the '
+            'prebuilt C library\'s DEFAULT_SYNCHRONOUS / '
+            'DEFAULT_WAL_SYNCHRONOUS — a value no Dart code declares and '
+            'no other test would notice changing');
+    expect(autoCheckpoint, 1,
+        reason: 'the writer must fold the WAL on every commit. 1000 here '
+            'means the readback hit a pool reader instead of the writer '
+            '(the routing rule changed) or the open-time pragma was '
+            'dropped — either way the durability pin above is no longer '
+            'measuring the writer');
+    expect(journalMode, 'wal',
+        reason: 'a pooled open must put the database in WAL mode; without '
+            'it neither of the two settings above has anything to govern');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // enableWal() is the OTHER door into WAL mode
+  //
+  // The open-time writer pragmas above are applied on the pooled branch
+  // of `_performOpen` only, because that is the only branch that OPENS
+  // in `journal_mode=wal`. But `enableWal()` is public and moves an
+  // already-open connection INTO WAL by itself. `openDb(readerPoolSize:
+  // 0)` opens in `journal_mode=delete` (measured), so the open-time
+  // pragmas are deliberately skipped there — and a consumer that then
+  // calls `enableWal()` reaches a WAL database carrying the stock
+  // `wal_autocheckpoint=1000` and an unpinned `synchronous`: exactly the
+  // silent-data-loss configuration the pragmas above exist to prevent,
+  // reached through the public API by a different door.
+  //
+  // Whichever door a database enters WAL through, it must leave with the
+  // same guarantees.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test(
+      'WAL checkpoint: enableWal on a pool-less open pins the same writer settings as a pooled open',
+      () async {
+    // `readerPoolSize: 0` is the point of this test, not an economy: it
+    // opens in `journal_mode=delete`, so WAL here can only come from the
+    // `enableWal()` call below — the path the open-time pragmas do not
+    // cover.
+    final db = await _createTestDb('wal_enable_wal_pin.db');
+    await db.enableWal();
+
+    // Readback rule as in the pooled pin test above: `synchronous` and
+    // `wal_autocheckpoint` are per-connection, so they must be read off
+    // the WRITER. There is no pool on this path, so every read already
+    // lands on the single writer connection; the transaction-after-a-
+    // write shape is kept anyway so both pin tests measure the same way
+    // and `wal_autocheckpoint == 1` keeps working as the witness that
+    // the readback hit the writer.
+    await _runSql(db, 'CREATE TABLE enable_wal_pin_tbl (id INTEGER PRIMARY KEY)');
+    await db.beginTransaction();
+    await _runSql(db, 'INSERT INTO enable_wal_pin_tbl (id) VALUES (1)');
+
+    Future<Object?> readPragma(String pragma) async {
+      final stmt = await db.prepareQuery('PRAGMA $pragma');
+      return await stmt.executeScalar();
+    }
+
+    final synchronous = await readPragma('synchronous');
+    final autoCheckpoint = await readPragma('wal_autocheckpoint');
+    final journalMode = await readPragma('journal_mode');
+
+    await db.rollback();
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(journalMode, 'wal',
+        reason: 'enableWal() must actually move the pool-less connection '
+            'into WAL — without it the two settings below govern nothing');
+    expect(autoCheckpoint, 1,
+        reason: 'enableWal() put this database in WAL, so it owes the same '
+            'fold policy a pooled open establishes. 1000 here is SQLite\'s '
+            'stock DEFAULT_WAL_AUTOCHECKPOINT: committed frames would sit '
+            'in the -wal and any read of the main .db file alone would '
+            'silently miss them');
+    expect(synchronous, 2,
+        reason: 'the writer must run at synchronous=FULL (2) once it is in '
+            'WAL, pinned explicitly rather than inherited from the prebuilt '
+            'C library\'s DEFAULT_SYNCHRONOUS / DEFAULT_WAL_SYNCHRONOUS');
+  });
+
+  test('WAL checkpoint: enableWal inside a transaction is rejected up front',
+      () async {
+    // Inside a transaction SQLite refuses BOTH halves of enableWal:
+    // `PRAGMA journal_mode=WAL` cannot switch modes, and
+    // `PRAGMA synchronous` answers 'Safety level may not be changed
+    // inside a transaction' (measured). So the call can only verify,
+    // never establish.
+    //
+    // A pooled database is the case that makes the guard necessary: it
+    // is ALREADY in WAL, so the journal-mode statement is a silent no-op
+    // success and the call used to look like it worked while
+    // establishing nothing. On a pool-less database in `delete` mode the
+    // same call failed instead — the same API "succeeding" or failing on
+    // nothing but the journal mode it happened to find. The guard makes
+    // both answer alike, before any pragma runs.
+    final db = await _createTestDb('wal_enable_wal_in_txn.db', readerPoolSize: 2);
+    await _runSql(db, 'CREATE TABLE txn_gate_tbl (id INTEGER PRIMARY KEY)');
+    await db.beginTransaction();
+    await _runSql(db, 'INSERT INTO txn_gate_tbl (id) VALUES (1)');
+
+    await expectLater(
+        db.enableWal(),
+        throwsA(isA<DbasSqliteException>().having((e) => e.code, 'code',
+            DbasSqliteErrorCode.enableWalInsideTransaction)));
+
+    // The rejection is a guard, not damage: the transaction is untouched
+    // and still commits.
+    await db.commit();
+    final stmt = await db.prepareQuery('SELECT COUNT(*) FROM txn_gate_tbl');
+    final rows = await stmt.executeScalar();
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(rows, 1,
+        reason: 'enableWal must reject without disturbing the open '
+            'transaction — the row committed before it was still there');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // executeScript — the multi-statement door
+  //
+  // `prepareQuery` + `DbasSqliteStatement.executeSql` is ONE
+  // `sqlite3_prepare_v2`, one step, one `sqlite3_finalize`, and the C
+  // side passes `pzTail` as a hard `nullptr` — so everything after the
+  // first `;` is discarded with NO error of any kind: the step reports
+  // `SQLITE_DONE` and the caller sees a clean success.
+  //
+  // The damage is not theoretical. A runtime-created table loses every
+  // explicit `CREATE INDEX` that follows it in the same string — a
+  // UNIQUE index therefore enforces nothing — and a
+  // `PRAGMA foreign_keys = ON` written as the last statement of a
+  // four-statement open script never applies at all.
+  //
+  // `executeScript` routes to the C `ExecuteSql` entry point, which is
+  // `sqlite3_exec`: the one path in this library that already loops over
+  // every statement. Nothing splits on `;` in Dart, and nothing may:
+  // `sqlite3_complete` is not exported by the shipped binary, and the
+  // consuming app's DDL carries `CHECK` bodies full of arbitrary user
+  // SQL that a naive split would shred.
+  //
+  // `CREATE INDEX` appeared ZERO times in any `.dart` in this repo
+  // before these tests, and nothing anywhere read `sqlite_master` for
+  // `type='index'`. That gap is why this shipped.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test('executeScript: every statement in the script runs, not just the first',
+      () async {
+    final db = await _createTestDb('script_multi_statement.db');
+
+    // Four statements. Under the prepare path only `CREATE TABLE` would
+    // survive; the index and both rows would vanish silently.
+    await db.executeScript('''
+      CREATE TABLE script_tbl (id INTEGER PRIMARY KEY, code TEXT NOT NULL);
+      CREATE UNIQUE INDEX ux_script_tbl_code ON script_tbl (code);
+      INSERT INTO script_tbl (id, code) VALUES (1, 'a');
+      INSERT INTO script_tbl (id, code) VALUES (2, 'b');
+    ''');
+
+    final tables = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'script_tbl'");
+    // The load-bearing assertion, and the one nothing in this repo made
+    // before: `type='index'`. A dropped tail leaves the TABLE in place,
+    // so a table-only check passes while the schema is silently wrong.
+    final indexes = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ux_script_tbl_code'");
+    final rows = await _queryInt(db, 'SELECT COUNT(*) FROM script_tbl');
+
+    // An index that exists in `sqlite_master` but does not ENFORCE would
+    // be the same bug one layer down, so prove the constraint bites.
+    Object? duplicateError;
+    try {
+      await _runSql(db, "INSERT INTO script_tbl (id, code) VALUES (3, 'a')");
+    } catch (e) {
+      duplicateError = e;
+    }
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(tables, 1, reason: 'statement 1 (CREATE TABLE) must have run');
+    expect(indexes, 1,
+        reason: 'statement 2 (CREATE UNIQUE INDEX) must have run — this is '
+            'the statement the one-prepare/one-step path drops silently, '
+            'and no test in this repo has ever looked for it');
+    expect(rows, 2,
+        reason: 'statements 3 and 4 (both INSERTs) must have run — a script '
+            'stops at nothing but a failure');
+    expect(
+        duplicateError,
+        isA<DbasSqliteException>().having((e) => e.subCategory, 'subCategory',
+            DbasSqliteSubCategory.duplicatedData),
+        reason: 'the UNIQUE index must actually enforce: a CREATE INDEX that '
+            'is recorded but not applied would be the same silent-schema '
+            'bug one layer down');
+  });
+
+  test('executeScript: a trailing PRAGMA foreign_keys = ON actually applies',
+      () async {
+    // The reported production damage, reproduced in its original shape:
+    // `PRAGMA foreign_keys = ON` written as the FOURTH statement of a
+    // four-statement open script. Under the prepare path it is discarded
+    // with the rest of the tail, so every foreign key in the database
+    // silently stops being enforced.
+    final db = await _createTestDb('script_pragma_tail.db');
+
+    await db.executeScript('''
+      CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE fk_child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER NOT NULL REFERENCES fk_parent (id)
+      );
+      INSERT INTO fk_parent (id) VALUES (1);
+      PRAGMA foreign_keys = ON;
+    ''');
+
+    final fkStmt = await db.prepareQuery('PRAGMA foreign_keys');
+    final fkEnabled = await fkStmt.executeScalar();
+    await fkStmt.close();
+
+    Object? orphanError;
+    try {
+      await _runSql(db, 'INSERT INTO fk_child (id, parent_id) VALUES (1, 99)');
+    } catch (e) {
+      orphanError = e;
+    }
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(fkEnabled, 1,
+        reason: 'the 4th statement of the script must have applied — a '
+            'dropped tail leaves foreign_keys at its default 0 and the '
+            'readback is the only way to see it');
+    expect(
+        orphanError,
+        isA<DbasSqliteException>().having((e) => e.subCategory, 'subCategory',
+            DbasSqliteSubCategory.foreignKeyViolation),
+        reason: 'foreign_keys=ON must be in force, not merely recorded: an '
+            'orphan child row has to be rejected');
+  });
+
+  test(
+      'executeScript: the prepare path still drops the tail — the limit executeScript exists for',
+      () async {
+    // A PIN, not a RED. This documents the boundary the new dartdoc on
+    // `prepareQuery` / `DbasSqliteStatement.executeSql` now states out
+    // loud, and it passes before and after `executeScript` lands.
+    //
+    // The silence is the whole hazard: the call below RETURNS NORMALLY.
+    // There is no rc, no exception and no log to notice — the second
+    // statement simply never existed as far as SQLite is concerned.
+    final db = await _createTestDb('script_prepare_path_limit.db');
+
+    await _runSql(db, '''
+      CREATE TABLE limit_tbl (id INTEGER PRIMARY KEY);
+      CREATE INDEX ix_limit_tbl_id ON limit_tbl (id);
+    ''');
+
+    final tables = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'limit_tbl'");
+    final indexes = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ix_limit_tbl_id'");
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(tables, 1,
+        reason: 'the FIRST statement runs, which is exactly what makes the '
+            'drop invisible — the caller sees a table and assumes the rest '
+            'landed too');
+    expect(indexes, 0,
+        reason: 'everything after the first ; is discarded by the one-prepare/'
+            'one-step path, silently. If this ever reads 1 the prepare path '
+            'grew multi-statement support and the docs pointing callers at '
+            'executeScript need revisiting');
+  });
+
+  test(
+      'executeScript: a failure stops the script and leaves earlier statements applied',
+      () async {
+    // `sqlite3_exec`'s real contract, and the reason the atomicity
+    // caveat has to be documented: outside a transaction each statement
+    // is its own implicit transaction, so statement 1 is ALREADY
+    // COMMITTED by the time statement 2 fails. There is no rollback to
+    // be had — the failure is not atomic and cannot be made so from
+    // inside this call.
+    final db = await _createTestDb('script_mid_failure.db');
+
+    Object? error;
+    try {
+      await db.executeScript('''
+        CREATE TABLE midfail_kept (id INTEGER PRIMARY KEY);
+        INSERT INTO no_such_table_xyz (id) VALUES (1);
+        CREATE TABLE midfail_never (id INTEGER PRIMARY KEY);
+      ''');
+    } catch (e) {
+      error = e;
+    }
+
+    final kept = await _rowCountOrAbsent(db, 'midfail_kept');
+    final never = await _rowCountOrAbsent(db, 'midfail_never');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(
+        error,
+        isA<DbasSqliteException>()
+            .having((e) => e.code, 'code', DbasSqliteErrorCode.executeScriptFailed)
+            .having((e) => e.category, 'category',
+                DbasSqliteErrorCategory.executeFailed),
+        reason: 'the failure must surface as a DbasSqliteException with its '
+            'own code — silently returning an rc is what this whole change '
+            'exists to stop');
+    expect((error as DbasSqliteException).message, contains('no_such_table_xyz'),
+        reason: 'sqlite3_exec reports WHICH statement failed via errmsg; '
+            'dropping that leaves the caller with a script and no offender');
+    expect(kept, 0,
+        reason: 'statement 1 ran and, in autocommit, is already committed — '
+            'the script is NOT atomic on its own');
+    expect(never, -1,
+        reason: 'the script stops at the first failure: statement 3 must '
+            'never have run');
+  });
+
+  test(
+      'executeScript: wrapping the script in a caller transaction is what makes it atomic',
+      () async {
+    // The documented remedy for the caveat above — and the reason
+    // `executeScript` does NOT copy `vacuum()`'s in-transaction guard.
+    // Rejecting inside a transaction would leave callers with only the
+    // non-atomic mode, i.e. force the very hazard the docs warn about.
+    final db = await _createTestDb('script_txn_atomic.db');
+    await db.beginTransaction();
+
+    Object? error;
+    try {
+      await db.executeScript('''
+        CREATE TABLE txnfail_tbl (id INTEGER PRIMARY KEY);
+        INSERT INTO no_such_table_xyz (id) VALUES (1);
+      ''');
+    } catch (e) {
+      error = e;
+    }
+    await db.rollback();
+
+    final kept = await _rowCountOrAbsent(db, 'txnfail_tbl');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(error, isA<DbasSqliteException>(),
+        reason: 'the script must still fail the same way inside a '
+            'transaction');
+    expect(kept, -1,
+        reason: 'statement 1 must be GONE. Inside the caller\'s transaction '
+            'there is no implicit per-statement commit, so the rollback '
+            'takes the CREATE TABLE with it — this is the only way to get '
+            'all-or-nothing out of a script');
+  });
+
+  test('executeScript: runs inside a transaction without deadlocking on the writer lock',
+      () async {
+    // `beginTransaction` holds the writer lock for the transaction's
+    // whole lifetime and the queue is FIFO, so a naive
+    // `_acquireWriterLock()` here would queue behind ITSELF and park for
+    // the full `kWriterLockWaitTimeoutMs`. `executeScript` must register
+    // as a reentrant writer user instead, exactly as
+    // `DbasSqliteStatement.executeSql` does.
+    //
+    // The commit below is the second half of the proof: a reentrant
+    // registration that is never released would make `commit()` throw
+    // `commitBlockedByInFlightOperation` instead.
+    final db = await _createTestDb('script_in_transaction.db');
+    DbasSqlite.debugWriterLockWaitTimeoutMs = 2000;
+    addTearDown(() => DbasSqlite.debugWriterLockWaitTimeoutMs = null);
+
+    await db.beginTransaction();
+    await db.executeScript('''
+      CREATE TABLE txn_script_tbl (id INTEGER PRIMARY KEY, code TEXT);
+      CREATE UNIQUE INDEX ux_txn_script_code ON txn_script_tbl (code);
+      INSERT INTO txn_script_tbl (id, code) VALUES (1, 'x');
+    ''');
+    await db.commit();
+
+    final indexes = await _queryInt(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ux_txn_script_code'");
+    final rows = await _queryInt(db, 'SELECT COUNT(*) FROM txn_script_tbl');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(indexes, 1,
+        reason: 'the whole script must have run inside the transaction and '
+            'survived the commit');
+    expect(rows, 1, reason: 'the INSERT in the script must have committed');
+  });
+
+  test('executeScript: returns affected rows and discards result rows',
+      () async {
+    // Two contracts in one measurement, because they share a script:
+    //   - affected rows come from the CONNECTION-scoped accessor
+    //     (`sqlite3_changes64`), which is what the C header says exists
+    //     for `ExecuteSql` callers — no stmt handle exists in that flow;
+    //   - `sqlite3_exec` is called with a nullptr callback, so the
+    //     trailing SELECT's rows go nowhere. It must not throw, and it
+    //     must not disturb the change counter either.
+    final db = await _createTestDb('script_affected_rows.db');
+    await _runSql(db, 'CREATE TABLE affected_tbl (id INTEGER PRIMARY KEY)');
+
+    final affected = await db.executeScript('''
+      INSERT INTO affected_tbl (id) VALUES (1);
+      INSERT INTO affected_tbl (id) VALUES (2);
+      INSERT INTO affected_tbl (id) VALUES (3);
+      DELETE FROM affected_tbl WHERE id > 1;
+      SELECT * FROM affected_tbl;
+    ''');
+    final remaining = await _queryInt(db, 'SELECT COUNT(*) FROM affected_tbl');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(affected, 2,
+        reason: 'the count belongs to the last ROW-CHANGING statement (the '
+            'DELETE removed 2), not to the script as a whole and not to the '
+            'trailing SELECT');
+    expect(remaining, 1,
+        reason: 'the DELETE really ran — the returned count is not a number '
+            'invented by the wrapper');
+  });
+
+  test('executeScript: rejects when the database is not opened', () async {
+    final db = await DbasSqlite.getInstance(dbName: 'script_not_opened.db');
+    await db.dropDb();
+
+    await expectLater(
+        db.executeScript('CREATE TABLE never_tbl (id INTEGER PRIMARY KEY)'),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.executeScriptDatabaseNotOpened)
+            .having((e) => e.category, 'category',
+                DbasSqliteErrorCategory.notOpened)));
+  });
 }

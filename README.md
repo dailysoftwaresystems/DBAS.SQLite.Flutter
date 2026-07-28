@@ -21,6 +21,7 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
 - Reads automatically use pool readers; writes use the dedicated writer
 - Falls back to single connection if pool creation fails or `readerPoolSize = 0`
 - Native pool has mutex-protected reader acquire/release for thread safety
+- The writer is pinned to `PRAGMA synchronous=FULL` and `PRAGMA wal_autocheckpoint=1` when it enters WAL, so **every commit folds the WAL back into the main `.db` file** — committed data is always present in the file a copy, a backup or `streamCopyDb` reads, instead of sitting in the `-wal`. Measured cost: about **+2.2 ms per commit** (~3.5× on a 2000-commit write loop). The cost is per *commit*, not per row, so batch bulk writes into a single transaction — N writes inside one transaction pay for one checkpoint. `closeDb()` and `streamCopyDb()` checkpoint on their own; `checkpoint()` is public for anything that reads the `.db` file by other means
 - **Web** uses an equivalent multi-worker pool (1 writer + N reader Web Workers, each its own SQLite connection, coordinated via a `SharedArrayBuffer`-backed WAL SHM) so reads and writes run on separate connections just like native. **Requires the page to be cross-origin isolated** — see [Web Setup](#web-setup); without it the web side falls back to a single connection (no read/write concurrency)
 
 ### Thread Safety & Parallel Readers
@@ -46,7 +47,7 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
 - **Lifecycle**
   - `getInstance(dbName:)` - Get singleton instance for a database
   - `openDb({readerPoolSize})` - Open database with connection pool
-  - `closeDb()` - Close database connection (automatically closes all active readers)
+  - `closeDb()` - Close database connection (automatically closes all active readers, rolls back any open transaction, then folds the WAL into the main `.db` file)
   - `isOpened()` - Check connection status
   - `getAppDatabasePath()` - Get platform-specific database path
   - `databaseExists()` - Check if the database file exists
@@ -55,17 +56,21 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
 - **Database Content**
   - `attachDb(bytes)` - Attach a database from raw bytes
   - `attachStreamDb(stream)` - Attach a database from a byte stream
-  - `streamCopyDb(destDbName)` - Stream-copy database to a new name
+  - `streamCopyDb(destDbName)` - Stream-copy database to a new name (checkpoints first, so the copy is self-contained — only the main `.db` file is copied)
   - `getContent()` - Get the raw bytes of the database file
+  - `checkpoint()` - Fold committed WAL frames into the main `.db` file. Returns a `DbasSqliteCheckpointResult` (`busy`, `log`, `checkpointed`, `isComplete`). Read `isComplete` (`checkpointed == log`) — `busy` is **not** a success signal: a PASSIVE checkpoint that folds nothing because a reader pins the WAL still reports `busy: 0` and `SQLITE_OK`. An incomplete fold is recoverable, not an error: the pinned frames fold at the next opportunity
 
 - **SQL Execution**
-  - `executeSql(sql, {params, nameParams})` - Execute DDL/DML statements with optional positional or named parameters
+  - `prepareQuery(sql)` - Prepare **one** statement, returns a `DbasSqliteStatement`. Everything after the first `;` is silently discarded — no rc, no exception, no log — so a multi-statement string must go to `executeScript` instead
+  - `executeSql(sql, {params, nameParams})` - Execute DDL/DML statements with optional positional or named parameters. One statement per call, same limit as `prepareQuery`
   - `executeReader(sql, {params, nameParams})` - Prepare a SELECT query, returns an independent `DbasSqliteReader`
+  - `executeScript(sql)` - Run a whole multi-statement script via `sqlite3_exec`. The only call that executes more than one statement. No bindings (the text must be complete — never interpolate untrusted values), result rows are discarded, execution stops at the first failing statement with everything before it already applied, and there is **no atomicity across the script** unless you wrap it: `await db.transaction((tx) => tx.executeScript(sql))`. Returns the **last** row-changing statement's change count, not a total
 
 - **Transactions**
-  - `beginTransaction()` - Begin a new transaction (idempotent)
-  - `commit()` - Commit the current transaction (idempotent)
-  - `rollback()` - Rollback the current transaction (idempotent)
+  - `beginTransaction({strict = false})` - Begin a new transaction. Idempotent by default: if one is already active this joins it (no second hold on the writer lock). `strict: true` never joins — it parks on the writer-lock queue until the active transaction ends, then issues its own `BEGIN`. A `strict: true` call from the flow that already owns the transaction is a self-deadlock and fails with `writerLockWaitTimeout`
+  - `startedCurrentTransaction` - Whether the last `beginTransaction()` issued a real `BEGIN` or took the join path. Read it right after the `await`, and use it to decide whether ending the transaction is your job: `if (db.startedCurrentTransaction) await db.commit();`
+  - `commit()` - Commit the current transaction (idempotent). Pre-flights the writer connection first and throws `commitBlockedByInFlightOperation` / `commitBlockedByActiveReader` rather than committing out from under an unfinished write or an open writer-routed reader. There is no reference counting — a joiner's `commit()` ends the transaction for everyone
+  - `rollback()` - Rollback the current transaction (idempotent). Drains in-flight writes first, then issues `ROLLBACK`
   - `transaction(action)` - Execute an action within a transaction with automatic commit/rollback
   - `isInTransaction` - Check if a transaction is currently active
 
@@ -98,7 +103,7 @@ Add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  dbas_sqlite: ^2.7.2
+  dbas_sqlite: ^2.8.4
 ```
 
 Or install with the Dart CLI:
@@ -309,7 +314,84 @@ try {
   await db.rollback();
   rethrow;
 }
+
+// A helper that may or may not be called inside someone else's
+// transaction: begin, then only end what you actually started.
+await db.beginTransaction();
+final owned = db.startedCurrentTransaction; // read before the next await
+try {
+  // ...writes...
+  if (owned) await db.commit();
+} catch (_) {
+  if (owned) await db.rollback();
+  rethrow;
+}
 ```
+
+`commit()` pre-flights the writer connection: every write started inside
+the transaction must be awaited, and every reader opened inside it (once
+the transaction has written, reads route to the writer connection for
+read-your-writes) must be closed, before `commit()` is called. Otherwise
+it throws `commitBlockedByInFlightOperation` / `commitBlockedByActiveReader`
+and leaves the transaction untouched — committing there would end the
+transaction and hand the writer lock to the next waiter while that work
+is still running on the connection. Neither error is transient: finish
+the work, then commit again. `rollback()` does not throw for this — it
+drains in-flight writes and then rolls back, because it is also the
+cleanup path used by `closeDb()`.
+
+### Multi-Statement Scripts
+
+`prepareQuery` / `executeSql` run exactly **one** statement — everything
+after the first `;` is dropped at prepare time, silently and with a
+success return. Use `executeScript` for anything that holds more than
+one statement (runtime DDL plus its indexes, a migration step, a pragma
+block):
+
+```dart
+// Not atomic on its own — wrap it when it must be all-or-nothing.
+await db.transaction((tx) => tx.executeScript('''
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    total TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS ix_orders_user ON orders (user_id, id);
+  PRAGMA foreign_keys = ON;
+'''));
+```
+
+The script takes no bindings (`sqlite3_exec` has no bind surface), so
+build parameterised SQL with `prepareQuery` instead and never
+interpolate untrusted values into a script. Result rows are discarded —
+a `SELECT` in a script runs and yields nothing. Execution stops at the
+first statement that fails, and every statement before it has already
+run; outside a transaction those are already committed and nothing can
+take them back. The return value is the change count of the **last**
+row-changing statement, not a total for the script.
+
+### WAL & Checkpoints
+
+Every commit folds the WAL into the main `.db` file, and `closeDb()` /
+`streamCopyDb()` fold on their own, so committed data is in the file
+that a copy or backup reads. When you read, copy or ship the `.db` file
+by other means, checkpoint explicitly and check the result:
+
+```dart
+final result = await db.checkpoint();
+if (!result.isComplete) {
+  // A reader is pinning a WAL snapshot: `result.log - result.checkpointed`
+  // frames stay in the -wal and fold at the next opportunity. Nothing
+  // committed is lost, but a copy of the main .db file alone would be
+  // missing them right now — close in-flight readers and try again.
+}
+```
+
+`isComplete` (`checkpointed == log`) is the only honest test.
+`result.busy` is not: a PASSIVE checkpoint that folds nothing still
+reports `busy: 0` and success. `checkpoint()` throws
+`checkpointInsideTransaction` if a transaction is open — SQLite refuses
+to checkpoint a connection holding one, so it would fold nothing.
 
 ### Connection Pool
 

@@ -102,7 +102,15 @@ abstract class DbasSqliteNativeInterface {
   Future<void> dropDb(String fileName);
 
   /// One-shot SQL (DDL/DML) without bindings. Used by
-  /// `BEGIN`/`COMMIT`/`ROLLBACK`/`VACUUM`/`PRAGMA wal_checkpoint`.
+  /// `BEGIN`/`COMMIT`/`ROLLBACK`/`VACUUM` and by the open-time writer
+  /// pragmas `PRAGMA synchronous=FULL` and
+  /// `PRAGMA wal_autocheckpoint=1`.
+  ///
+  /// Only the rc comes back — **result rows are discarded**, which is
+  /// why `PRAGMA wal_checkpoint` does NOT go through here: its single
+  /// `(busy, log, checkpointed)` row is the only honest report of what
+  /// the checkpoint actually folded, so `DbasSqlite.checkpoint`
+  /// prepares and steps it as a statement instead.
   Future<int> executeSql(int dbPtr, String sql);
 
   /// Returns the C lib's rc from `CloseDb`. `checkpoint == true`
