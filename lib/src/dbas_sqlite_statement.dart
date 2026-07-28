@@ -46,6 +46,11 @@ class DbasSqliteStatement {
   int? _lastErrorCode;
   int? _lastUniqueErrorCode;
 
+  /// Whether [_activeReader] is bound to the writer connection. Written
+  /// together with [_activeReader] so the pair can never disagree; read
+  /// through [hasOpenWriterReaderInternal].
+  bool _activeReaderUsesWriter = false;
+
   /// Internal — see [DbasSqlite.prepareQuery].
   DbasSqliteStatement.internal(
     this._db,
@@ -59,6 +64,24 @@ class DbasSqliteStatement {
   /// `true` after [close] has been called or after the database
   /// closed and invalidated this statement.
   bool get isClosed => _closed;
+
+  /// `true` while this statement has a reader open **and** that reader
+  /// is bound to the writer connection — the case where a `COMMIT`
+  /// would end the transaction, and hand the writer lock on, underneath
+  /// a live cursor. `false` for readers bound to a pool connection (a
+  /// WAL pool read doesn't touch the writer connection) and whenever no
+  /// reader is open on this statement.
+  ///
+  /// Internal seam for [DbasSqlite.commit]'s pre-flight check. Safe for
+  /// it to reach this only through `_activeStatements`: a statement is
+  /// removed from that set exactly once, on the last line of [close],
+  /// and [close] first awaits `reader.close()` — which flips the
+  /// reader's `isClosed` synchronously — so this getter is already
+  /// `false` before the statement can leave the set.
+  bool get hasOpenWriterReaderInternal =>
+      _activeReader != null &&
+      !_activeReader!.isClosed &&
+      _activeReaderUsesWriter;
 
   // ── Bindings (positional, fluent) ────────────────────────────────────
 
@@ -220,8 +243,24 @@ class DbasSqliteStatement {
     _lastErrorCode = null;
     _lastUniqueErrorCode = null;
 
+    // `lockHeld` distinguishes two very different callers:
+    //   - Outside a transaction: this call must acquire the writer lock
+    //     itself — nobody else is holding the writer connection for us.
+    //   - Inside a transaction: `beginTransaction` already holds the
+    //     writer lock for the transaction's whole lifetime, so this call
+    //     must NOT re-acquire it (the queue is FIFO — it would queue
+    //     behind itself and deadlock). It registers as a REENTRANT user
+    //     instead, so `commit()` can see that ending the transaction
+    //     right now would hand the writer lock to the next FIFO waiter
+    //     while this call's dispatch (prepare / bind / step / finalize)
+    //     is still running on the connection. See [DbasSqlite.commit].
     final lockHeld = _db.isInTransaction;
-    if (!lockHeld) await _db.acquireWriterLockInternal();
+    ReentrantWriterOpToken? reentrantOp;
+    if (lockHeld) {
+      reentrantOp = _db.beginReentrantWriterOpInternal();
+    } else {
+      await _db.acquireWriterLockInternal();
+    }
     // Mark the transaction dirty up-front. Subsequent reads in the same
     // tx must route through the writer connection to observe this
     // statement's effects (read-your-writes). Setting before dispatch
@@ -229,10 +268,38 @@ class DbasSqliteStatement {
     // through the writer — slower but never incorrect.
     _db.markTransactionWriteInternal();
 
+    // Ordering is load-bearing: start the dispatch chain WITHOUT
+    // awaiting it, so its still-pending future can be handed to the
+    // database before this method suspends. `rollback()` DRAINS that
+    // future instead of issuing ROLLBACK on top of it — a write whose
+    // step lands after the ROLLBACK would otherwise commit itself in
+    // autocommit mode and survive the rollback silently. See
+    // [DbasSqlite.rollback]. Both calls run in this same synchronous
+    // turn, so no other flow can observe an untracked registration.
+    final dispatch = _executeSqlDispatch();
+    if (reentrantOp != null) {
+      _db.trackReentrantWriterOpDispatchInternal(reentrantOp, dispatch);
+    }
+    try {
+      return await dispatch;
+    } finally {
+      if (reentrantOp != null) {
+        _db.endReentrantWriterOpInternal(reentrantOp);
+      } else {
+        _db.releaseWriterLockInternal();
+      }
+    }
+  }
+
+  /// The prepare / bind / step / finalize dispatch chain behind
+  /// [executeSql]. Split out of [_executeSqlNative] so that method can
+  /// hand this still-pending future to the owning [DbasSqlite] before it
+  /// suspends — see [_executeSqlNative] for why that ordering matters.
+  /// Owns no lock and no registration: the caller does all of that.
+  Future<int> _executeSqlDispatch() async {
     final conn = _db.dbInternal!;
     int handle = sqliteInvalidStmtHandle;
     try {
-      try {
       final prepared = await _platform.prepareQuery(conn, _sql);
       handle = prepared.handle;
       if (handle == sqliteInvalidStmtHandle) {
@@ -294,18 +361,15 @@ class DbasSqliteStatement {
           }
         }
       }
-      } on DbasSqliteException catch (e) {
-        // Capture the rcs onto the statement so post-failure callers
-        // of getLastErrorCode / getLastUniqueErrorCode see the same
-        // codes that are on the thrown exception, mirroring the
-        // reader path's onClose behaviour.
-        _lastError = e.message;
-        _lastErrorCode = e.sqliteCode;
-        _lastUniqueErrorCode = e.sqliteUniqueCode;
-        rethrow;
-      }
-    } finally {
-      if (!lockHeld) _db.releaseWriterLockInternal();
+    } on DbasSqliteException catch (e) {
+      // Capture the rcs onto the statement so post-failure callers
+      // of getLastErrorCode / getLastUniqueErrorCode see the same
+      // codes that are on the thrown exception, mirroring the
+      // reader path's onClose behaviour.
+      _lastError = e.message;
+      _lastErrorCode = e.sqliteCode;
+      _lastUniqueErrorCode = e.sqliteUniqueCode;
+      rethrow;
     }
   }
 
@@ -502,10 +566,23 @@ class DbasSqliteStatement {
         (_db.transactionHasWritesInternal || _db.poolPtrInternal == null);
     final DbasSqliteDb conn;
     final Future<void> Function() releaseFn;
+    ReentrantWriterOpToken? reentrantOp;
 
     if (useWriter) {
       conn = _db.dbInternal!;
       releaseFn = () async {};
+      // Reentrant, exactly like the write path in `_executeSqlNative` —
+      // deliberately skips `acquireWriterLockInternal` because
+      // `beginTransaction` already holds the lock. Register the in-flight
+      // dispatch NOW, before a `DbasSqliteReader` exists for `commit()`'s
+      // pre-flight to find via `hasOpenWriterReaderInternal`; the
+      // `finally` below un-registers it once the reader has taken over,
+      // so the two signals hand off with no gap.
+      //
+      // No dispatch future is tracked: `rollback()` drains WRITES only.
+      // A read cannot persist anything past a ROLLBACK, so there is
+      // nothing for a drain to protect — see [DbasSqlite.rollback].
+      reentrantOp = _db.beginReentrantWriterOpInternal();
     } else if (_db.poolPtrInternal != null) {
       final timeout = _db.poolAcquireTimeoutMsInternal;
       final readerPtr = await _db.acquireReaderConnectionInternal(timeout);
@@ -616,9 +693,15 @@ class DbasSqliteStatement {
         },
       );
       _activeReader = reader;
+      _activeReaderUsesWriter = useWriter;
       transferred = true;
       return reader;
     } finally {
+      // Hand off from the in-flight-dispatch signal to the open-reader
+      // signal: by now `_activeReader` is set (or the bailout below
+      // tears everything down), so `commit()`'s pre-flight keeps seeing
+      // this writer-connection user without a gap.
+      if (reentrantOp != null) _db.endReentrantWriterOpInternal(reentrantOp);
       // If we never got far enough to transfer ownership to a reader,
       // unwind everything we acquired in this scope. The primary
       // error is already in flight; cleanup failures are logged so

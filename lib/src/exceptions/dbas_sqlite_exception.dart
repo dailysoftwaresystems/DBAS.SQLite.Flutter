@@ -24,7 +24,11 @@ enum DbasSqliteErrorCode {
   beginTransactionDatabaseNotOpened,
   beginTransactionDatabaseClosedWaitingLock,
   beginTransactionFailed,
+  commitDatabaseNotOpened,
+  commitBlockedByInFlightOperation,
+  commitBlockedByActiveReader,
   commitFailed,
+  commitRollbackAlsoFailed,
   rollbackFailed,
   transactionAlreadyActive,
   transactionRollbackAlsoFailed,
@@ -37,6 +41,7 @@ enum DbasSqliteErrorCode {
 
   // DbasSqlite — locks / queues
   writerLockWaitCancelled,
+  writerLockWaitTimeout,
   readerSlotWaitTimeout,
   readerSlotWaitCancelled,
   acquireReaderConnectionNoPool,
@@ -105,6 +110,7 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.enableWalDatabaseNotOpened:
       case DbasSqliteErrorCode.beginTransactionDatabaseNotOpened:
       case DbasSqliteErrorCode.beginTransactionDatabaseClosedWaitingLock:
+      case DbasSqliteErrorCode.commitDatabaseNotOpened:
       case DbasSqliteErrorCode.vacuumDatabaseNotOpened:
       case DbasSqliteErrorCode.vacuumDatabaseClosedWaitingLock:
       case DbasSqliteErrorCode.statementClosed:
@@ -118,6 +124,7 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.readerSlotWaitTimeout:
       case DbasSqliteErrorCode.readerSlotWaitCancelled:
       case DbasSqliteErrorCode.writerLockWaitCancelled:
+      case DbasSqliteErrorCode.writerLockWaitTimeout:
       case DbasSqliteErrorCode.executeReaderPoolAcquireTimeout:
         return DbasSqliteErrorCategory.busyOrCancelled;
 
@@ -141,6 +148,9 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.enableWalFailed:
       case DbasSqliteErrorCode.beginTransactionFailed:
       case DbasSqliteErrorCode.commitFailed:
+      case DbasSqliteErrorCode.commitBlockedByInFlightOperation:
+      case DbasSqliteErrorCode.commitBlockedByActiveReader:
+      case DbasSqliteErrorCode.commitRollbackAlsoFailed:
       case DbasSqliteErrorCode.rollbackFailed:
       case DbasSqliteErrorCode.transactionAlreadyActive:
       case DbasSqliteErrorCode.transactionRollbackAlsoFailed:

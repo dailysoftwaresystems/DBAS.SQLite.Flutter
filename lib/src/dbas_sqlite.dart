@@ -12,6 +12,41 @@ import 'package:dbas_sqlite/src/helpers/dbas_sqlite_platform_util.dart';
 import 'package:dbas_sqlite/src/native/dbas_sqlite_native_interface.dart';
 import 'package:flutter/foundation.dart';
 
+/// Opaque handle for one reentrant use of the writer connection,
+/// handed out by [DbasSqlite.beginReentrantWriterOpInternal] and given
+/// back to [DbasSqlite.endReentrantWriterOpInternal].
+///
+/// Carries the operation's process-unique `id` **and** the `generation`
+/// (epoch) of the transaction it was registered against. Both halves
+/// are **load-bearing**: an un-registration only takes effect when both
+/// match a still-registered operation, so a token left over from a
+/// transaction that has already ended can never cancel a *later*
+/// transaction's live registration — see
+/// [DbasSqlite.endReentrantWriterOpInternal] for the silent failure
+/// that guards against.
+typedef ReentrantWriterOpToken = ({int id, int generation});
+
+/// One registered reentrant use of the writer connection. Lives in
+/// `DbasSqlite._reentrantWriterOps` between
+/// [DbasSqlite.beginReentrantWriterOpInternal] and
+/// [DbasSqlite.endReentrantWriterOpInternal].
+class _ReentrantWriterOp {
+  _ReentrantWriterOp(this.generation);
+
+  /// Epoch of the transaction this operation was registered against.
+  final int generation;
+
+  /// The still-pending dispatch chain behind this operation, or `null`
+  /// when there is nothing to wait for — either the operation never
+  /// registered one (reads don't), or its dispatch already settled.
+  ///
+  /// Never completes with an error:
+  /// [DbasSqlite.trackReentrantWriterOpDispatchInternal] neutralises it
+  /// so [DbasSqlite.rollback]'s drain can await it without inheriting
+  /// the operation's failure.
+  Future<void>? dispatch;
+}
+
 /// A cross-platform SQLite database wrapper for Flutter.
 ///
 /// Provides a unified API to interact with SQLite databases on
@@ -58,6 +93,15 @@ class DbasSqlite {
   /// when readers are too contended.
   static const int kSetBusyTimeoutAcquireMs = 5000;
 
+  /// Deadline for a caller parked on the writer-lock FIFO queue
+  /// (`executeSql` outside a transaction, `vacuum`, and
+  /// `beginTransaction` — including every `strict: true` call). The
+  /// writer-side twin of [kPoolAcquireTimeoutMs]: waiting forever turns
+  /// a self-deadlock into a wedged flow with no error and no
+  /// diagnostics, so the wait is bounded and surfaces
+  /// [DbasSqliteErrorCode.writerLockWaitTimeout] instead.
+  static const int kWriterLockWaitTimeoutMs = 30000;
+
   /// Test-only override for [kPoolAcquireTimeoutMs]. Setting this in
   /// production code is a smell; the field exists so timeout-path
   /// tests complete in milliseconds.
@@ -70,6 +114,14 @@ class DbasSqlite {
   @visibleForTesting
   static int? debugSetBusyTimeoutAcquireMs;
 
+  /// Test-only override for [kWriterLockWaitTimeoutMs]. Same rationale
+  /// as [debugPoolAcquireTimeoutMs] — the self-deadlock test for
+  /// `beginTransaction(strict: true)` would otherwise pause for 30 s on
+  /// every run. Reset it to `null` in a `finally`; it is static, so a
+  /// leaked override would shorten every later test's writer wait.
+  @visibleForTesting
+  static int? debugWriterLockWaitTimeoutMs;
+
   static final Map<String, DbasSqlite> _instance = {};
 
   final DbasSqlitePlatform _platform;
@@ -81,6 +133,34 @@ class DbasSqlite {
   // route through the writer connection (read-your-writes). Cleared on
   // begin/commit/rollback. The flag is only read by the statement layer.
   bool _transactionHasWrites = false;
+
+  /// `true` if the most recent [beginTransaction] call actually issued
+  /// `BEGIN TRANSACTION`; `false` if it took the idempotent join path.
+  /// Backing field for [startedCurrentTransaction].
+  bool _startedCurrentTransaction = false;
+
+  /// Every `executeSql` call — and the prepare phase of every
+  /// `executeReader` call — currently using the writer connection
+  /// REENTRANTLY, i.e. dispatched while already inside this active
+  /// transaction (per [DbasSqliteStatement]'s `lockHeld` / `useWriter`
+  /// routing) rather than through [_acquireWriterLock]. Keyed by the
+  /// operation id inside [ReentrantWriterOpToken].
+  ///
+  /// Read by [commit]'s pre-flight check (a non-empty map blocks the
+  /// `COMMIT`) and drained by [rollback] — see their docs for the two
+  /// different hazards those two treatments close.
+  final Map<int, _ReentrantWriterOp> _reentrantWriterOps = {};
+
+  /// Source of process-unique ids for [_reentrantWriterOps]. Ids are
+  /// never reused, so a token can only ever match the one operation it
+  /// was handed out for.
+  int _reentrantWriterOpSeq = 0;
+
+  /// Epoch stamped onto every [ReentrantWriterOpToken]. Rotated by
+  /// [_rotateReentrantWriterOpEpoch] whenever a transaction starts or
+  /// ends — see [endReentrantWriterOpInternal].
+  int _transactionGeneration = 0;
+
   int? _poolPtr;
   /// Reader count requested at openDb time; used by
   /// [setBusyTimeout] to bound its reader-reconfiguration loop. `0`
@@ -656,16 +736,94 @@ class DbasSqlite {
   /// Returns `true` if a transaction is currently active.
   bool get isInTransaction => _isInTransaction;
 
-  /// Begins a new database transaction. Idempotent — does nothing if
-  /// already inside a transaction.
-  Future<void> beginTransaction() async {
+  /// `true` if the most recent [beginTransaction] call on this instance
+  /// issued a real `BEGIN TRANSACTION` (that call started the
+  /// transaction); `false` if it took the idempotent no-op join path
+  /// because a transaction was already active.
+  ///
+  /// Only meaningful immediately after `await`ing [beginTransaction] —
+  /// read it before any other `await`, so no other caller's
+  /// [beginTransaction] / [commit] / [rollback] can run first and change
+  /// it underneath you. Dart's cooperative scheduling guarantees that
+  /// much: nothing else runs between your `await beginTransaction()`
+  /// resuming and your next synchronous statement. While a
+  /// `strict: true` call is still parked waiting for the writer lock,
+  /// this getter still reflects the *previous* completed call.
+  ///
+  /// A [beginTransaction] call made with `strict: true` always leaves
+  /// this `true` — strict mode never joins.
+  ///
+  /// Use it to decide whether YOUR code owns ending the transaction:
+  /// `if (db.startedCurrentTransaction) await db.commit();` skips the
+  /// call entirely when you merely joined a caller-controlled
+  /// transaction, avoiding the "a joiner's commit() ends the WHOLE
+  /// transaction" hazard described in [commit]'s docs (there is no
+  /// reference counting).
+  ///
+  /// Reset to `false` whenever the transaction ends ([commit] /
+  /// [rollback], by any caller) so a stale `true` can't outlive the
+  /// transaction it described.
+  bool get startedCurrentTransaction => _startedCurrentTransaction;
+
+  /// Begins a new database transaction.
+  ///
+  /// **Idempotent** by default (`strict: false`): if a transaction is
+  /// already active this call does nothing and returns immediately — it
+  /// does NOT take a second hold on the writer lock, and
+  /// [startedCurrentTransaction] is set to `false` so the caller can
+  /// tell it joined rather than started one. [DbasSqlite] tracks at most
+  /// one active transaction with no reference counting, so a single
+  /// [commit] / [rollback] call — made by ANY caller sharing this
+  /// instance, not necessarily the one whose [beginTransaction] issued
+  /// `BEGIN TRANSACTION` — ends the transaction for everyone. That is
+  /// unchanged from all prior releases.
+  ///
+  /// Pass `strict: true` to opt out of the idempotent join. A strict
+  /// call NEVER joins an already-active transaction: it parks on the
+  /// writer-lock FIFO queue (the same queue a plain `executeSql()`
+  /// outside a transaction waits on) until that transaction's [commit] /
+  /// [rollback] releases the lock, and only then issues its own `BEGIN
+  /// TRANSACTION` — so it always leaves [startedCurrentTransaction] as
+  /// `true`. Uncontended, `strict: true` and `strict: false` behave
+  /// identically.
+  ///
+  /// **⚠️ `strict: true` from the flow that already owns the
+  /// transaction is a self-deadlock.** Strict mode does not (and cannot)
+  /// know that the caller waiting for the writer lock is the same flow
+  /// that holds it: it parks, and the only thing that would wake it is a
+  /// [commit] / [rollback] that flow can no longer reach because it is
+  /// parked. The wait is therefore **bounded** — after
+  /// [kWriterLockWaitTimeoutMs] the call gives up, removes itself from
+  /// the queue, and throws
+  /// [DbasSqliteErrorCode.writerLockWaitTimeout], leaving the
+  /// transaction it could not join completely untouched. Treat that
+  /// error as a bug in the calling code, not a transient: retrying it
+  /// will time out again. Use `strict: true` only where the flow is
+  /// genuinely independent of any transaction it might contend with, and
+  /// use [startedCurrentTransaction] (not a second `beginTransaction`)
+  /// to find out whether you are inside someone else's.
+  ///
+  /// Throws [DbasSqliteErrorCode.beginTransactionDatabaseNotOpened] if
+  /// the database isn't opened,
+  /// [DbasSqliteErrorCode.writerLockWaitTimeout] if the writer-lock wait
+  /// exceeds [kWriterLockWaitTimeoutMs],
+  /// [DbasSqliteErrorCode.writerLockWaitCancelled] if the database is
+  /// closed while this call is waiting for that lock, or
+  /// [DbasSqliteErrorCode.beginTransactionDatabaseClosedWaitingLock] if
+  /// it was closed after the lock was granted. A failed `BEGIN
+  /// TRANSACTION` throws
+  /// [DbasSqliteErrorCode.beginTransactionFailed].
+  Future<void> beginTransaction({bool strict = false}) async {
     if (!isOpened()) {
       throw DbasSqliteException.dart(
         DbasSqliteErrorCode.beginTransactionDatabaseNotOpened,
         'Database is not opened. Please open the database before starting a transaction.',
       );
     }
-    if (_isInTransaction) return;
+    if (!strict && _isInTransaction) {
+      _startedCurrentTransaction = false;
+      return;
+    }
 
     await _acquireWriterLock();
     try {
@@ -687,23 +845,119 @@ class DbasSqlite {
         );
       }
       _transactionHasWrites = false;
+      _rotateReentrantWriterOpEpoch();
       _isInTransaction = true;
+      _startedCurrentTransaction = true;
     } catch (_) {
       if (!_isInTransaction) _releaseWriterLock();
       rethrow;
     }
   }
 
+  /// Throws if it is unsafe to issue `COMMIT` right now because some
+  /// other in-flight use of the writer connection — a reentrant
+  /// `executeSql` / `executeReader` dispatch, or a reader opened inside
+  /// this transaction and routed to the writer — has not finished.
+  ///
+  /// Called by [commit] **before** it touches `_isInTransaction` or the
+  /// writer lock, so a caller that hits this can fix the issue (await
+  /// the write, close the reader) and call `commit()` again without
+  /// anything having been disturbed.
+  void _assertNoInFlightWriterUsers() {
+    if (_reentrantWriterOps.isNotEmpty) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.commitBlockedByInFlightOperation,
+        'Cannot commit: ${_reentrantWriterOps.length} operation(s) started '
+        'inside this transaction (an executeSql, or the prepare phase of '
+        'an executeReader) have not finished yet. Await every write and '
+        'read before calling commit() — committing now would end the '
+        'transaction and hand the writer lock to the next waiter while '
+        'those dispatches are still running on the writer connection.',
+      );
+    }
+    for (final stmt in _activeStatements) {
+      if (stmt.hasOpenWriterReaderInternal) {
+        throw DbasSqliteException.dart(
+          DbasSqliteErrorCode.commitBlockedByActiveReader,
+          'Cannot commit: a reader opened inside this transaction (routed '
+          'to the writer connection for read-your-writes) is still open. '
+          'Close it via reader.close() — or exhaust it via readRow() — '
+          'before calling commit(). Its cursor lives on the writer '
+          'connection: committing now would leave it stepping against a '
+          'connection whose transaction has ended and whose writer lock '
+          'has already been handed to the next waiter, so the rows it '
+          'still returns belong to no transaction and the next writer can '
+          'change them mid-iteration.',
+        );
+      }
+    }
+  }
+
   /// Commits the current transaction. No-op if no transaction is active.
   ///
-  /// If COMMIT fails the implicit recovery is to `rollback()`. When
-  /// the rollback ALSO fails, the rollback's failure is logged via
-  /// `dart:developer` and the original COMMIT exception is rethrown —
-  /// so the caller sees the proximate cause (commit failure) rather
-  /// than the recovery failure. This mirrors `transaction()`'s
-  /// behaviour for the same shape.
+  /// Before issuing `COMMIT`, a pre-flight check verifies the writer
+  /// connection is quiescent: no `executeSql()` (or the prepare phase of
+  /// an `executeReader()`) started inside this transaction is still in
+  /// flight, and no reader opened inside this transaction — routed to
+  /// the writer connection for read-your-writes, see
+  /// [DbasSqliteStatement.executeReader] — is still open. Skipping the
+  /// check would let `COMMIT`, and the writer-lock release that follows
+  /// it, race that still-running work: [beginTransaction] is
+  /// **idempotent**, so a caller that joined an already-active
+  /// transaction never acquired the writer lock itself; if THAT caller's
+  /// `commit()` ran while the real owner still had a write or a reader
+  /// in flight, the owner's dispatch would keep using the writer
+  /// connection after this method already committed and handed the lock
+  /// to whoever is next in the FIFO queue. Violating the check throws
+  /// immediately, **before** `_isInTransaction` or the writer lock is
+  /// touched, with:
+  ///   - [DbasSqliteErrorCode.commitBlockedByInFlightOperation]
+  ///   - [DbasSqliteErrorCode.commitBlockedByActiveReader] — readers on
+  ///     a pool connection (opened outside any transaction, or inside
+  ///     one before its first write) are never affected; a WAL pool read
+  ///     doesn't touch the writer connection at all.
+  ///
+  /// Neither is a transient: both mean "you called `commit()` at the
+  /// wrong time". Await the write / close the reader, then commit again.
+  ///
+  /// If `COMMIT` fails, the implicit recovery is to [rollback]. When
+  /// ONLY the rollback recovery succeeds the ORIGINAL
+  /// [DbasSqliteErrorCode.commitFailed] is rethrown unchanged. When BOTH
+  /// `COMMIT` and the subsequent [rollback] fail, a
+  /// [DbasSqliteException] with code
+  /// [DbasSqliteErrorCode.commitRollbackAlsoFailed] is thrown instead —
+  /// the original `COMMIT` failure is preserved on
+  /// [DbasSqliteException.cause] with its stack trace on
+  /// [DbasSqliteException.causeStackTrace]; the rollback failure is
+  /// logged via `dart:developer` (its stack would otherwise be lost in
+  /// the wrapper). When the original error is itself a
+  /// [DbasSqliteException] its [DbasSqliteException.sqliteCode] and
+  /// [DbasSqliteException.sqliteUniqueCode] are lifted onto the outer
+  /// exception. This mirrors [transaction]'s handling of the identical
+  /// shape; `commit()` gets its own code (not
+  /// [DbasSqliteErrorCode.transactionRollbackAlsoFailed]) so callers can
+  /// tell a bare `commit()` apart from one made through [transaction].
+  ///
+  /// Throws [DbasSqliteErrorCode.commitDatabaseNotOpened] if the
+  /// database was closed while a transaction was still marked active —
+  /// should not normally happen; mirrors the defensive guard already in
+  /// [beginTransaction] / [vacuum].
   Future<void> commit() async {
     if (!_isInTransaction) return;
+    if (!isOpened()) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.commitDatabaseNotOpened,
+        'Database is not opened. The connection was closed while a '
+        'transaction was still marked active — this indicates a bug; '
+        'please report it.',
+      );
+    }
+    // Both guards sit OUTSIDE the try on purpose: a pre-flight failure
+    // must not trigger the auto-rollback recovery below. It means "you
+    // called commit() at the wrong time", not "the database operation
+    // failed", so the transaction is left completely untouched and the
+    // caller can retry once the blocker is gone.
+    _assertNoInFlightWriterUsers();
     try {
       final rc = await _platform.executeSql(_db!, 'COMMIT');
       if (rc != sqliteOk) {
@@ -718,20 +972,55 @@ class DbasSqlite {
       }
       _isInTransaction = false;
       _transactionHasWrites = false;
+      _startedCurrentTransaction = false;
+      _rotateReentrantWriterOpEpoch();
       _releaseWriterLock();
-    } catch (_) {
+    } catch (originalError, originalStack) {
       try {
         await rollback();
       } catch (rollbackError, rollbackStack) {
-        // Don't let the rollback failure mask the COMMIT failure —
-        // log it with its stack and continue to rethrow the original.
+        // The rollback failure would otherwise be swallowed, leaving the
+        // caller unable to tell "recovered" from "state unknown". Log it
+        // with its own stack — only the wrapper's cause/stack survive
+        // below — and surface the distinct code.
         developer.log(
           'commit: rollback failed after COMMIT failure; '
-          'rethrowing the original COMMIT exception',
+          'wrapping into commitRollbackAlsoFailed',
           name: 'dbas_sqlite.DbasSqlite',
           error: rollbackError,
           stackTrace: rollbackStack,
         );
+        // Lift the most specific rc/extended-rc pair we can find. Prefer
+        // originalError's codes since it's the proximate cause; fall
+        // back to the rollback failure's codes.
+        int? liftedPrimary;
+        int? liftedUnique;
+        if (originalError is DbasSqliteException) {
+          liftedPrimary = originalError.sqliteCode;
+          liftedUnique = originalError.sqliteUniqueCode;
+        } else if (rollbackError is DbasSqliteException) {
+          liftedPrimary = rollbackError.sqliteCode;
+          liftedUnique = rollbackError.sqliteUniqueCode;
+        }
+        final msg = 'COMMIT failed: $originalError. '
+            'Additionally, rollback also failed: $rollbackError. '
+            'The database may be in an inconsistent state.';
+        final ex = liftedPrimary != null
+            ? DbasSqliteException.sqlite(
+                DbasSqliteErrorCode.commitRollbackAlsoFailed,
+                msg,
+                sqliteCode: liftedPrimary,
+                sqliteUniqueCode: liftedUnique,
+                cause: originalError,
+                causeStackTrace: originalStack,
+              )
+            : DbasSqliteException.dart(
+                DbasSqliteErrorCode.commitRollbackAlsoFailed,
+                msg,
+                cause: originalError,
+                causeStackTrace: originalStack,
+              );
+        Error.throwWithStackTrace(ex, originalStack);
       }
       rethrow;
     }
@@ -751,7 +1040,39 @@ class DbasSqlite {
   /// [DbasSqliteException.cause] (with its stack trace on
   /// [DbasSqliteException.causeStackTrace]) for programmatic
   /// inspection.
+  ///
+  /// **In-flight writes are drained, not rejected.** Unlike [commit],
+  /// which refuses to run while the writer connection is busy,
+  /// `rollback()` first **waits** for every write dispatched inside this
+  /// transaction to finish, then issues `ROLLBACK`. Waiting rather than
+  /// throwing is deliberate: `rollback()` is the best-effort cleanup
+  /// path used by [closeDb] and by error recovery throughout this class,
+  /// so a new way for it to fail would be a regression, not a safety
+  /// improvement.
+  ///
+  /// The drain is **load-bearing, not defensive**. `executeSql` replays
+  /// its bind buffer one bind at a time and every bind is its own
+  /// dispatch round-trip, so a write dispatched un-awaited inside an
+  /// open transaction is still walking a chain of pending dispatches
+  /// when `rollback()` runs. Without the drain the `ROLLBACK` slips
+  /// between two of that write's dispatches and its step then executes
+  /// on a connection that is back in autocommit mode: the row commits
+  /// **on its own** and survives the rollback, with no error raised on
+  /// either side. Measured against this library the race reproduced on
+  /// every attempt, from two binds upwards — it is inherent to the
+  /// dispatch model, not a wide-statement edge case.
+  ///
+  /// Readers are deliberately NOT drained or rejected — a `SELECT`
+  /// cannot persist anything past a `ROLLBACK`, so a live cursor only
+  /// ever observes data the rollback is about to undo (or, once it
+  /// lands, data belonging to no transaction). SQLite also tolerates a
+  /// `ROLLBACK` with live statements on the connection, unlike `COMMIT`.
   Future<void> rollback() async {
+    if (!_isInTransaction) return;
+    await _drainReentrantWriterOps();
+    // The drain suspends, so re-check: a concurrent commit()/rollback()
+    // on this shared instance may have ended the transaction while we
+    // waited, and issuing ROLLBACK outside a transaction would fail.
     if (!_isInTransaction) return;
     Object? rollbackCause;
     StackTrace? rollbackCauseStack;
@@ -778,6 +1099,8 @@ class DbasSqlite {
     } finally {
       _isInTransaction = false;
       _transactionHasWrites = false;
+      _startedCurrentTransaction = false;
+      _rotateReentrantWriterOpEpoch();
       _releaseWriterLock();
     }
     if (rollbackCauseStack != null) {
@@ -922,6 +1245,24 @@ class DbasSqlite {
 
   // ── Async writer lock (FIFO) ─────────────────────────────────────────
 
+  /// Waits for the writer lock, FIFO. The wait is bounded by
+  /// [kWriterLockWaitTimeoutMs] (overridable in tests via
+  /// [debugWriterLockWaitTimeoutMs]) and throws
+  /// [DbasSqliteErrorCode.writerLockWaitTimeout] when the deadline
+  /// passes, mirroring [_acquireReaderSlot]'s
+  /// [DbasSqliteErrorCode.readerSlotWaitTimeout].
+  ///
+  /// An unbounded wait here is not "safe by default": the caller most
+  /// likely to be starved is the flow that already owns the lock —
+  /// `beginTransaction(strict: true)` called from inside its own
+  /// transaction — and nothing can ever wake it. The bound turns a
+  /// silently wedged flow into a diagnosable error.
+  ///
+  /// Removing the waiter from the queue BEFORE completing it with the
+  /// timeout error is load-bearing: [_releaseWriterLock] grants the lock
+  /// to whatever it finds at the head of the queue, so a timed-out
+  /// waiter left in place would be handed a lock nobody will ever
+  /// release.
   Future<void> _acquireWriterLock() async {
     if (_closing) {
       throw DbasSqliteException.dart(
@@ -935,7 +1276,27 @@ class DbasSqlite {
     }
     final waiter = Completer<void>();
     _writerWaitQueue.add(waiter);
-    await waiter.future;
+    final timeoutMs = debugWriterLockWaitTimeoutMs ?? kWriterLockWaitTimeoutMs;
+    Timer? timer;
+    if (timeoutMs > 0) {
+      timer = Timer(Duration(milliseconds: timeoutMs), () {
+        if (waiter.isCompleted) return;
+        _writerWaitQueue.remove(waiter);
+        waiter.completeError(DbasSqliteException.dart(
+          DbasSqliteErrorCode.writerLockWaitTimeout,
+          'Writer-lock wait timed out after ${timeoutMs}ms — the lock is '
+          'held by another transaction or write that never released it. '
+          'If this was beginTransaction(strict: true), check whether the '
+          'calling flow already owns the transaction: strict mode never '
+          'joins, so it would be waiting on itself.',
+        ));
+      });
+    }
+    try {
+      await waiter.future;
+    } finally {
+      timer?.cancel();
+    }
   }
 
   void _releaseWriterLock() {
@@ -945,6 +1306,15 @@ class DbasSqlite {
       _writerLockHeld = false;
     }
   }
+
+  /// Number of callers currently parked in [_acquireWriterLock] waiting
+  /// for the writer lock. Test-only seam so a test can pump the event
+  /// loop until the expected number of waiters have registered — e.g. to
+  /// prove a `beginTransaction(strict: true)` call really parked instead
+  /// of silently joining — instead of guessing with a fixed
+  /// `Future.delayed`. Mirrors [debugReaderSlotWaitQueueLength].
+  @visibleForTesting
+  int get debugWriterLockWaitQueueLength => _writerWaitQueue.length;
 
   void _cancelWriterWaitQueue() {
     while (_writerWaitQueue.isNotEmpty) {
@@ -1041,6 +1411,100 @@ class DbasSqlite {
       debugPoolAcquireTimeoutMs ?? kPoolAcquireTimeoutMs;
   void unregisterStatementInternal(DbasSqliteStatement stmt) =>
       _activeStatements.remove(stmt);
+
+  /// Registers an `executeSql` / `executeReader` dispatch that is using
+  /// the writer connection **reentrantly** — it observed
+  /// [isInTransaction] as `true` and deliberately did not acquire the
+  /// writer lock, because [beginTransaction] already holds it for the
+  /// transaction's whole lifetime.
+  ///
+  /// While at least one operation is registered, [commit] refuses to run
+  /// and throws
+  /// [DbasSqliteErrorCode.commitBlockedByInFlightOperation] — see its
+  /// docs for the hazard. Pair every call with exactly one
+  /// [endReentrantWriterOpInternal] passing the returned token; a write
+  /// additionally hands its dispatch future to
+  /// [trackReentrantWriterOpDispatchInternal], which is what lets
+  /// [rollback] drain it.
+  ReentrantWriterOpToken beginReentrantWriterOpInternal() {
+    final id = ++_reentrantWriterOpSeq;
+    _reentrantWriterOps[id] = _ReentrantWriterOp(_transactionGeneration);
+    return (id: id, generation: _transactionGeneration);
+  }
+
+  /// Un-registers the operation [token] identifies. Unknown or
+  /// out-of-epoch tokens are ignored.
+  ///
+  /// **The epoch match is load-bearing, not defensive padding.** A late
+  /// un-registration is genuinely reachable: [rollback] deliberately
+  /// does not reject an open reader (see its docs), so it can end a
+  /// transaction while an `executeReader` dispatched inside it is still
+  /// in flight, and that dispatch's un-registration then lands against
+  /// whatever transaction is current by then. Treating it as a plain
+  /// "decrement, clamped at zero" would cancel a *live* registration
+  /// belonging to the NEXT transaction and let a [commit] straight
+  /// through the pre-flight that should have blocked it — silently
+  /// re-opening exactly the race this mechanism exists to close.
+  /// Matching on the token's id **and** generation is what makes a late
+  /// un-registration a true no-op.
+  void endReentrantWriterOpInternal(ReentrantWriterOpToken token) {
+    final op = _reentrantWriterOps[token.id];
+    if (op == null || op.generation != token.generation) return;
+    _reentrantWriterOps.remove(token.id);
+  }
+
+  /// Attaches the still-pending [dispatch] chain of the operation
+  /// [token] identifies, so [rollback] can **drain** it — wait for it to
+  /// finish before issuing `ROLLBACK` — instead of racing it.
+  ///
+  /// Only writes register a dispatch. A read cannot persist anything
+  /// past a `ROLLBACK`, so there is nothing for a drain to protect, and
+  /// gating rollback on readers is explicitly out of scope (see
+  /// [rollback]). An operation with no registered dispatch still blocks
+  /// [commit] — it just isn't something [rollback] waits for.
+  ///
+  /// [dispatch]'s failure is neutralised here: the drain must never
+  /// inherit the operation's error, and the operation's real caller is
+  /// already awaiting it.
+  void trackReentrantWriterOpDispatchInternal(
+      ReentrantWriterOpToken token, Future<void> dispatch) {
+    final op = _reentrantWriterOps[token.id];
+    if (op == null || op.generation != token.generation) return;
+    op.dispatch = dispatch
+        .then<void>((_) {}, onError: (Object _, StackTrace _) {})
+        .whenComplete(() => op.dispatch = null);
+  }
+
+  /// Waits until no registered reentrant operation has a live dispatch
+  /// chain left. Never throws — every tracked future is neutralised by
+  /// [trackReentrantWriterOpDispatchInternal].
+  ///
+  /// Loops rather than awaiting one snapshot: a caller can dispatch
+  /// another un-awaited write while we are parked here, and draining
+  /// "everything that was in flight when we started" would leave exactly
+  /// the write that arrived last un-drained. Each tracked future clears
+  /// itself from its operation once it settles, so the loop makes strict
+  /// progress and ends as soon as the writer connection is quiescent.
+  Future<void> _drainReentrantWriterOps() async {
+    while (true) {
+      final pending = <Future<void>>[
+        for (final op in _reentrantWriterOps.values)
+          if (op.dispatch != null) op.dispatch!,
+      ];
+      if (pending.isEmpty) return;
+      await Future.wait(pending);
+    }
+  }
+
+  /// Forgets every still-registered reentrant operation and moves the
+  /// generation forward, so a token held by an operation that outlived
+  /// its transaction can no longer match a registration made by the next
+  /// one. Called wherever the set of operations that may legitimately
+  /// block a [commit] resets: [beginTransaction], [commit], [rollback].
+  void _rotateReentrantWriterOpEpoch() {
+    _reentrantWriterOps.clear();
+    _transactionGeneration++;
+  }
 
   /// Acquires a pool-reader connection, gated by the Dart-level
   /// reader-slot semaphore so at most [_readerPoolSize] concurrent
