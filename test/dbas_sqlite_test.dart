@@ -71,6 +71,87 @@ Future<void> _awaitWriterWaiters(DbasSqlite db, int count,
       reason: 'expected at least $count parked writer-lock waiter(s)');
 }
 
+// ── WAL-checkpoint probes ─────────────────────────────────────────────
+//
+// The only assertion that actually proves committed data reached the
+// main `.db` file is "rows visible in a main-file-only copy": copy the
+// `.db` WITHOUT its `-wal`/`-shm` and open the copy. Frames that were
+// never folded out of the WAL live only in the `-wal`, so the copy is
+// short — or has no table at all — until a checkpoint runs. File sizes
+// are a useful secondary signal, never the proof.
+
+/// Runs [sql] and returns the first column of the first row as an int,
+/// or `-1` when the query produced no rows.
+Future<int> _queryInt(DbasSqlite db, String sql) async {
+  final stmt = await db.prepareQuery(sql);
+  try {
+    final reader = await stmt.executeReader();
+    try {
+      if (!await reader.readRow()) return -1;
+      return reader.getColumnInt(0);
+    } finally {
+      await reader.close();
+    }
+  } finally {
+    await stmt.close();
+  }
+}
+
+/// Rows in [table] (optionally narrowed by [where]), or `-1` when
+/// [table] is absent from the schema entirely. Never throws for a
+/// missing table, so an unfolded WAL shows up as a readable row-count
+/// mismatch instead of a `no such table` crash that hides which of the
+/// two failure modes happened.
+Future<int> _rowCountOrAbsent(DbasSqlite db, String table,
+    {String? where}) async {
+  final present = await _queryInt(db,
+      "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '$table'");
+  if (present < 1) return -1;
+  final filter = where == null ? '' : ' WHERE $where';
+  return await _queryInt(db, 'SELECT COUNT(*) FROM $table$filter');
+}
+
+/// Byte sizes of the main `.db` and its `-wal`, formatted for `reason:`
+/// strings. `-1` means the file does not exist.
+Future<String> _walFootprint(DbasSqlite db) async {
+  final base = await db.getAppDatabasePath();
+  Future<int> len(String suffix) async {
+    final f = File('$base$suffix');
+    return await f.exists() ? await f.length() : -1;
+  }
+
+  return 'main=${await len('')}B, wal=${await len('-wal')}B';
+}
+
+/// Copies ONLY the main `.db` file of [db] — deliberately leaving the
+/// `-wal` and `-shm` behind — into [probeDbName], opens the copy, and
+/// returns [_rowCountOrAbsent] for [table] there. The copy is dropped
+/// before returning, so the same [probeDbName] can be reused.
+///
+/// [db] may be open or closed; only the resolved path is used.
+Future<int> _rowsInMainFileOnly(
+    DbasSqlite db, String table, String probeDbName,
+    {String? where}) async {
+  final srcPath = await db.getAppDatabasePath();
+  final probe = await DbasSqlite.getInstance(dbName: probeDbName);
+  final probePath = await probe.getAppDatabasePath();
+  // A stale foreign `-wal` beside a copied `.db` opens with NO error and
+  // silently serves the OTHER database's rows, so clear all three first.
+  for (final suffix in const ['', '-wal', '-shm']) {
+    final f = File('$probePath$suffix');
+    if (await f.exists()) await f.delete();
+  }
+  await File(srcPath).copy(probePath);
+
+  await probe.openDb(readerPoolSize: 0);
+  try {
+    return await _rowCountOrAbsent(probe, table, where: where);
+  } finally {
+    await probe.closeDb();
+    await probe.dropDb();
+  }
+}
+
 void main() async {
   setUpAll(() async {
     // Clean test database directory before all tests
@@ -6465,4 +6546,442 @@ void main() async {
   // (No direct test — _workerErrorFromJsError is private to web_pool.dart
   // and runs only on web. The behaviour is verified by web integration
   // tests; the helper's contract is documented in its dartdoc.)
+
+  // ──────────────────────────────────────────────────────────────────────
+  // WAL checkpoint — committed data must reach the main `.db` file
+  //
+  // A pooled open (`readerPoolSize >= 1`, the `openDb()` default and the
+  // production configuration) puts the database in `journal_mode=wal`.
+  // Dart then issues no pragmas of its own, so SQLite's stock
+  // `wal_autocheckpoint=1000` is inherited and committed frames pile up
+  // in the `-wal` indefinitely — measured: 200 committed inserts leave
+  // the main `.db` at 4096 bytes with an 832 KB `-wal`, and the table is
+  // not in the main file AT ALL. Anything that reads the main `.db`
+  // alone — a file copy, a backup, `streamCopyDb`, the consumer's
+  // `copyDatabase` — then sees a truncated or entirely empty database,
+  // with no error of any kind.
+  //
+  // Spec: a checkpoint happens AUTOMATICALLY on
+  //   1. commit,
+  //   2. closeDb — rolling back any open transaction FIRST, because a
+  //      checkpoint issued inside an open transaction is a silent no-op,
+  //   3. any insert/update/delete outside a transaction.
+  // (1) and (3) are one mechanism: bare DML is an implicit transaction
+  // that commits.
+  //
+  // Every assertion below is "rows visible in a main-file-only copy",
+  // the only signal that actually proves frames left the WAL. `-1` in a
+  // failure message means the table never reached the main file at all.
+  // File sizes appear in `reason:` strings as a secondary diagnostic.
+  //
+  // `readerPoolSize: 0` is deliberately NOT used here: that path opens
+  // in `journal_mode=delete`, where there is no WAL and nothing to
+  // checkpoint, so it cannot exercise this behaviour at all.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test(
+      'WAL checkpoint: bare DML outside a transaction folds into the main db file',
+      () async {
+    final db = await _createTestDb('wal_bare_dml.db', readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE bare_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    // 200 implicit transactions — comfortably under the stock
+    // `wal_autocheckpoint=1000` frame threshold, so nothing folds by
+    // accident and the assertion measures the intended mechanism only.
+    for (var i = 1; i <= 200; i++) {
+      await _runSql(db, 'INSERT INTO bare_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'row$i']);
+    }
+
+    final footprint = await _walFootprint(db);
+    final rows =
+        await _rowsInMainFileOnly(db, 'bare_tbl', 'wal_bare_dml_probe.db');
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(rows, 200,
+        reason: 'each insert outside a transaction is an implicit '
+            'transaction that commits, so all 200 rows must live in the main '
+            '.db file and survive a main-file-only copy. Source footprint at '
+            'copy time: $footprint');
+  });
+
+  test('WAL checkpoint: commit() folds each transaction into the main db file',
+      () async {
+    final db = await _createTestDb('wal_commit.db', readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE commit_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+
+    var written = 0;
+    final observed = <int>[];
+    final expected = <int>[];
+    final footprints = <String>[];
+    for (var txn = 1; txn <= 5; txn++) {
+      await db.beginTransaction();
+      for (var i = 0; i < 20; i++) {
+        written++;
+        await _runSql(db, 'INSERT INTO commit_tbl (id, val) VALUES (?, ?)',
+            params: [written, 'v$written']);
+      }
+      await db.commit();
+
+      footprints.add('after commit #$txn: ${await _walFootprint(db)}');
+      observed.add(
+          await _rowsInMainFileOnly(db, 'commit_tbl', 'wal_commit_probe.db'));
+      expected.add(written);
+    }
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(observed, expected,
+        reason: 'after every commit the main .db file must already hold every '
+            'row committed so far, so the running totals must track '
+            '$expected. Source footprints: ${footprints.join(' | ')}');
+  });
+
+  test('WAL checkpoint: closeDb folds even when it is NOT the last connection',
+      () async {
+    // `closeDb` performs no checkpoint of its own on either teardown
+    // path — the pool path calls `closePool`, the single-connection path
+    // hardcodes `checkpoint: false`. What makes the default case look
+    // healthy is SQLite itself: closing the LAST connection to a WAL
+    // database checkpoints implicitly. Keep one other connection alive
+    // and that safety net disappears.
+    //
+    // Two `DbasSqlite` instances over one physical database give exactly
+    // that: instances are keyed by `dbName`, but `getAppDatabasePath`
+    // concatenates the name onto the directory, so 'x.db' and './x.db'
+    // are two independent instances — two real SQLite connections —
+    // resolving to a single file. That is precisely the situation any
+    // second opener of the same database file creates.
+    const writerName = 'wal_close_nonlast.db';
+    const holderName = './wal_close_nonlast.db';
+
+    final writer = await _createTestDb(writerName, readerPoolSize: 4);
+    await _runSql(
+        writer, 'CREATE TABLE nonlast_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+
+    final holder = await DbasSqlite.getInstance(dbName: holderName);
+    await holder.openDb(readerPoolSize: 0);
+    expect(holder.isOpened(), isTrue,
+        reason: 'the second connection must really be open, otherwise this '
+            'test degenerates into the last-connection case that folds by '
+            'itself and proves nothing');
+
+    for (var i = 1; i <= 200; i++) {
+      await _runSql(writer, 'INSERT INTO nonlast_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'row$i']);
+    }
+
+    await writer.closeDb();
+
+    final footprint = await _walFootprint(writer);
+    final rows = await _rowsInMainFileOnly(
+        writer, 'nonlast_tbl', 'wal_nonlast_probe.db');
+
+    // Only ONE dropDb: both instances name the same physical file, and
+    // `dropDb` also tears down the shared per-file native delegate, so a
+    // second call would dereference a delegate that no longer exists.
+    await holder.closeDb();
+    await holder.dropDb();
+
+    expect(rows, 200,
+        reason: 'closeDb must fold the WAL into the main .db file itself, not '
+            'lean on SQLite\'s last-connection auto-checkpoint, so the data '
+            'is durable in the main file even while another connection keeps '
+            'the database open. Footprint after closeDb: $footprint');
+  });
+
+  test(
+      'WAL checkpoint: closeDb with an open transaction rolls back FIRST, then folds',
+      () async {
+    // Same two-connection setup as the previous test, so closeDb has to
+    // do the checkpoint itself rather than inherit SQLite's
+    // last-connection behaviour — that is what makes the ORDER
+    // observable here.
+    const writerName = 'wal_close_open_txn.db';
+    const holderName = './wal_close_open_txn.db';
+
+    final db = await _createTestDb(writerName, readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE close_txn_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 30; i++) {
+      await _runSql(db, 'INSERT INTO close_txn_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'committed$i']);
+    }
+
+    final holder = await DbasSqlite.getInstance(dbName: holderName);
+    await holder.openDb(readerPoolSize: 0);
+    expect(holder.isOpened(), isTrue);
+
+    // Open transaction, deliberately never committed. `closeDb` must
+    // roll it back BEFORE checkpointing: a checkpoint issued while a
+    // transaction is still open is a SILENT no-op — no row, no error,
+    // WAL untouched — so the wrong order would also strand the 30
+    // already-committed rows in the WAL.
+    await db.beginTransaction();
+    for (var i = 1000; i < 1010; i++) {
+      await _runSql(db, 'INSERT INTO close_txn_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'uncommitted$i']);
+    }
+    expect(db.isInTransaction, isTrue);
+
+    await db.closeDb();
+
+    final footprint = await _walFootprint(db);
+    final committed = await _rowsInMainFileOnly(
+        db, 'close_txn_tbl', 'wal_close_txn_probe.db',
+        where: "val LIKE 'committed%'");
+    final uncommitted = await _rowsInMainFileOnly(
+        db, 'close_txn_tbl', 'wal_close_txn_probe.db',
+        where: "val LIKE 'uncommitted%'");
+
+    await holder.closeDb();
+    await holder.dropDb();
+
+    expect(committed, 30,
+        reason: 'rollback must happen BEFORE the checkpoint — a checkpoint '
+            'attempted while the transaction was still open is a silent '
+            'no-op, which would leave these 30 committed rows stranded in '
+            'the WAL. -1 means the table never reached the main file at all. '
+            'Footprint after closeDb: $footprint');
+    expect(uncommitted, 0,
+        reason: 'the open transaction must be rolled back by closeDb, so its '
+            'rows must never reach the main .db file');
+  });
+
+  test('WAL checkpoint: a zero-frame checkpoint is reportable', () async {
+    // NOTE FOR THE FIX: this test is written against an API that does
+    // NOT exist yet and is the one API-shape decision baked into these
+    // frozen tests — `DbasSqlite.checkpoint()`, resolving to the three
+    // values `PRAGMA wal_checkpoint` produces: `busy`, `log` (frames in
+    // the WAL) and `checkpointed` (frames folded into the main file).
+    // The result is used without a type annotation on purpose, so it can
+    // be a record `({int busy, int log, int checkpointed})` or a class
+    // with those three members — whichever the fix prefers.
+    //
+    // Why the library needs it at all: `busy` is NOT a success signal. A
+    // PASSIVE checkpoint that folds nothing reports `busy=0` and returns
+    // SQLITE_OK — measured `[0, 10, 0]` — which is indistinguishable
+    // from a full fold by every signal `executeSql` currently surfaces
+    // (it returns the rc and discards the triple). The only honest test
+    // of "did the data actually reach the main file" is
+    // `checkpointed == log`.
+    final seed = await _createTestDb('wal_checkpoint_report.db',
+        readerPoolSize: 4);
+    await _runSql(
+        seed, 'CREATE TABLE report_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 50; i++) {
+      await _runSql(seed, 'INSERT INTO report_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'seed$i']);
+    }
+    // Close/reopen so the WAL starts empty and the pinned snapshot below
+    // sits at frame 0 — every frame written afterwards is then provably
+    // above it.
+    await seed.closeDb();
+    final db = await DbasSqlite.getInstance(dbName: 'wal_checkpoint_report.db');
+    await db.openDb(readerPoolSize: 4);
+
+    final pinned =
+        await db.prepareQuery('SELECT id FROM report_tbl ORDER BY id');
+    final pinnedReader = await pinned.executeReader();
+    expect(await pinnedReader.readRow(), isTrue);
+
+    for (var i = 100; i < 110; i++) {
+      await _runSql(db, 'INSERT INTO report_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'above$i']);
+    }
+
+    final blocked = await db.checkpoint();
+    expect(blocked.busy, greaterThanOrEqualTo(0),
+        reason: 'the busy flag must be readable, not swallowed');
+    expect(blocked.log, greaterThan(0),
+        reason: 'frames written above the pinned snapshot are still in the WAL');
+    expect(blocked.checkpointed, 0,
+        reason: 'a reader pinned below every one of those frames makes the '
+            'checkpoint fold nothing — that zero MUST be reportable, because '
+            'the checkpoint otherwise looks completely successful');
+    expect(blocked.checkpointed == blocked.log, isFalse,
+        reason: 'checkpointed == log is the real success test; it must be '
+            'false here');
+
+    await pinnedReader.close();
+    await pinned.close();
+
+    final released = await db.checkpoint();
+    expect(released.log, greaterThan(0));
+    expect(released.checkpointed, released.log,
+        reason: 'once the snapshot is released the same frames fold '
+            'completely, and checkpointed == log must say so');
+
+    await db.closeDb();
+    await db.dropDb();
+  });
+
+  test(
+      'WAL checkpoint: streamCopyDb produces a complete copy of an open database',
+      () async {
+    // `streamCopyDb` copies only the main `.db` and deletes the
+    // destination's `-wal`/`-shm`, so every frame still sitting in the
+    // source WAL is silently dropped from the copy. The existing
+    // "streamCopyDb copies database to new name" test hides this with a
+    // close/reopen dance and the comment "Re-open to ensure WAL is
+    // flushed"; no consumer should have to do that.
+    final src = await _createTestDb('wal_copy_src.db', readerPoolSize: 4);
+    await _runSql(
+        src, 'CREATE TABLE copy_wal_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 200; i++) {
+      await _runSql(src, 'INSERT INTO copy_wal_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'row$i']);
+    }
+
+    await src.streamCopyDb('wal_copy_dest.db');
+    final footprint = await _walFootprint(src);
+
+    final dest = await DbasSqlite.getInstance(dbName: 'wal_copy_dest.db');
+    await dest.openDb(readerPoolSize: 0);
+    final rows = await _rowCountOrAbsent(dest, 'copy_wal_tbl');
+    await dest.closeDb();
+    await dest.dropDb();
+
+    await src.closeDb();
+    await src.dropDb();
+
+    expect(rows, 200,
+        reason: 'streamCopyDb of a live database must yield a complete, '
+            'self-contained copy without any manual close/reopen dance. '
+            'Source footprint at copy time: $footprint');
+  });
+
+  test(
+      'WAL checkpoint: folding must not stall on busy_timeout when a reader holds a snapshot',
+      () async {
+    final db = await _createTestDb('wal_no_stall.db', readerPoolSize: 4);
+    await _runSql(
+        db, 'CREATE TABLE stall_tbl (id INTEGER PRIMARY KEY, val TEXT)');
+    for (var i = 1; i <= 50; i++) {
+      await _runSql(db, 'INSERT INTO stall_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'seed$i']);
+    }
+
+    // Pin a read snapshot on a pool reader and hold it. Frames written
+    // from here on sit ABOVE that snapshot, so no checkpoint can fold
+    // them. Measured on this database: PASSIVE reports the shortfall as
+    // `[0, 10, 0]` in ~0 ms, while TRUNCATE blocks for the whole
+    // busy_timeout — 5034 ms — and then folds exactly the same zero
+    // frames, `[1, 10, 0]`. That is why TRUNCATE must never be used
+    // unconditionally, and why these bounds are assertions rather than
+    // performance notes.
+    final pinned =
+        await db.prepareQuery('SELECT id FROM stall_tbl ORDER BY id');
+    final pinnedReader = await pinned.executeReader();
+    expect(await pinnedReader.readRow(), isTrue);
+
+    final dmlWatch = Stopwatch()..start();
+    for (var i = 100; i < 110; i++) {
+      await _runSql(db, 'INSERT INTO stall_tbl (id, val) VALUES (?, ?)',
+          params: [i, 'above$i']);
+    }
+    dmlWatch.stop();
+
+    final copyWatch = Stopwatch()..start();
+    await db.streamCopyDb('wal_no_stall_copy.db');
+    copyWatch.stop();
+
+    await pinnedReader.close();
+    await pinned.close();
+
+    final copy = await DbasSqlite.getInstance(dbName: 'wal_no_stall_copy.db');
+    await copy.dropDb();
+
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(dmlWatch.elapsedMilliseconds, lessThan(3000),
+        reason: '10 inserts under a pinned reader snapshot took '
+            '${dmlWatch.elapsedMilliseconds} ms — a per-DML checkpoint must '
+            'give up immediately when frames are pinned, never block on '
+            'busy_timeout (one TRUNCATE alone costs ~5 s here)');
+    expect(copyWatch.elapsedMilliseconds, lessThan(3000),
+        reason: 'streamCopyDb under a pinned reader snapshot took '
+            '${copyWatch.elapsedMilliseconds} ms — it must not block on '
+            'busy_timeout for frames it cannot fold anyway');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Writer connection settings — a pin, not a RED
+  //
+  // This test passes before AND after the change that added
+  // `PRAGMA synchronous=FULL` to the open path: FULL was already the
+  // value. Its job is to fail if the invariant is ever broken — a C
+  // library rebuilt with different flags, a dropped pragma, someone
+  // "simplifying" the open path.
+  //
+  // It pins values that are otherwise INVISIBLE compile-time defaults of
+  // a prebuilt binary. Measured from the shipped library via
+  // `PRAGMA compile_options` (SQLite 3.52.0): `DEFAULT_SYNCHRONOUS=2`,
+  // `DEFAULT_WAL_SYNCHRONOUS=2`, `DEFAULT_WAL_AUTOCHECKPOINT=1000`.
+  // Nothing in the Dart guaranteed the first two, so a future rebuild
+  // could change this database's durability with no code change and no
+  // test failure anywhere. Now a divergence fails loudly, here.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test(
+      'WAL checkpoint: a production-configured writer pins synchronous, wal_autocheckpoint and journal_mode',
+      () async {
+    // `readerPoolSize: 4` is `openDb()`'s OWN default — the production
+    // configuration — not `_createTestDb`'s default of 0. The 0 path
+    // opens in `journal_mode=delete` with no WAL at all, so it cannot
+    // exercise, let alone pin, any of this.
+    final db = await _createTestDb('wal_settings_pin.db', readerPoolSize: 4);
+
+    // The values are read back through the ordinary public API, but they
+    // MUST come off the WRITER connection: `synchronous` and
+    // `wal_autocheckpoint` are per-connection settings and the library
+    // applies them to the writer only. `executeReader` routes to the
+    // writer once the current transaction has performed a write, so the
+    // readback runs inside a transaction whose first statement is one.
+    //
+    // `wal_autocheckpoint == 1` doubles as the WITNESS that the readback
+    // really landed on the writer: a pool reader reports the stock 1000
+    // (measured). Should that routing rule ever change, this assertion
+    // fails loudly instead of quietly pinning `synchronous` — which
+    // reads 2 on every connection — against the wrong one.
+    await _runSql(db, 'CREATE TABLE pin_tbl (id INTEGER PRIMARY KEY)');
+    await db.beginTransaction();
+    await _runSql(db, 'INSERT INTO pin_tbl (id) VALUES (1)');
+
+    Future<Object?> readPragma(String pragma) async {
+      // `executeScalar` closes the reader and the statement itself, so
+      // no cursor is left open across the rollback below.
+      final stmt = await db.prepareQuery('PRAGMA $pragma');
+      return await stmt.executeScalar();
+    }
+
+    final synchronous = await readPragma('synchronous');
+    final autoCheckpoint = await readPragma('wal_autocheckpoint');
+    final journalMode = await readPragma('journal_mode');
+
+    await db.rollback();
+    await db.closeDb();
+    await db.dropDb();
+
+    expect(synchronous, 2,
+        reason: 'the writer must run at synchronous=FULL (2). It is issued '
+            'explicitly at open precisely so it does not depend on the '
+            'prebuilt C library\'s DEFAULT_SYNCHRONOUS / '
+            'DEFAULT_WAL_SYNCHRONOUS — a value no Dart code declares and '
+            'no other test would notice changing');
+    expect(autoCheckpoint, 1,
+        reason: 'the writer must fold the WAL on every commit. 1000 here '
+            'means the readback hit a pool reader instead of the writer '
+            '(the routing rule changed) or the open-time pragma was '
+            'dropped — either way the durability pin above is no longer '
+            'measuring the writer');
+    expect(journalMode, 'wal',
+        reason: 'a pooled open must put the database in WAL mode; without '
+            'it neither of the two settings above has anything to govern');
+  });
 }

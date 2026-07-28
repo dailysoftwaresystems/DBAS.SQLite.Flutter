@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:developer' as developer;
 
+import 'package:dbas_sqlite/src/dbas_sqlite_checkpoint_result.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_db.dart'
     if (dart.library.js_interop) 'package:dbas_sqlite/src/stub/dbas_sqlite_db_stub.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_platform.dart';
+import 'package:dbas_sqlite/src/dbas_sqlite_row_cache.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_statement.dart';
 import 'package:dbas_sqlite/src/exceptions/dbas_sqlite_exception.dart';
 import 'package:dbas_sqlite/src/helpers/paths/dbas_sqlite_paths.dart' as paths;
@@ -302,7 +304,30 @@ class DbasSqlite {
 
   /// Copies the current database to a new database with the given
   /// [destDbName]. Streamed chunk-by-chunk.
+  ///
+  /// **Checkpoints the WAL first.** Only the main `.db` file is copied,
+  /// and the destination's `-wal` / `-shm` are deleted — that deletion
+  /// is load-bearing for correctness, because a stale foreign `-wal`
+  /// beside a copied `.db` opens with NO error and silently serves the
+  /// OTHER database's rows, passing `integrity_check`. The consequence
+  /// is that every frame still sitting in the source WAL would be
+  /// dropped from the copy, so a PASSIVE checkpoint runs on the writer
+  /// first and the copy is self-contained with no close/reopen dance at
+  /// the call site.
+  ///
+  /// The checkpoint is **reported, not enforced**. When a reader holds a
+  /// WAL snapshot, the frames above it cannot be folded by any
+  /// checkpoint mode, and waiting would stall for the whole
+  /// `busy_timeout` and still fold nothing. Rather than fail the copy or
+  /// block on it, the shortfall is logged via `dart:developer`. Callers
+  /// that need a provably complete copy should call [checkpoint]
+  /// themselves and check [DbasSqliteCheckpointResult.isComplete] —
+  /// close in-flight readers, then copy.
   Future<void> streamCopyDb(String destDbName) async {
+    // Order is load-bearing: fold the WAL into the main `.db` BEFORE the
+    // raw file read below, which never looks at the `-wal`.
+    await _checkpointBeforeRawFileAccess('streamCopyDb("$destDbName")',
+        takeWriterLock: true);
     final src = await getAppDatabasePath(dbName: dbName);
     final dest = await getAppDatabasePath(dbName: destDbName);
     await _platform.streamCopyDb(src, dest);
@@ -420,6 +445,14 @@ class DbasSqlite {
         _readerSlotsAvailable = readerPoolSize;
         final writerPtr = _platform.poolGetWriter(dbName, poolPtr);
         _db = DbasSqliteDb(dbName, writerPtr);
+        // The pooled open is the ONLY path that OPENS the database in
+        // `journal_mode=wal`, so this is where the WAL's fold policy and
+        // the durability it folds under have to be established — before
+        // the writer is handed to any caller. Order is load-bearing:
+        // `synchronous` governs the fsync a checkpoint performs, so it
+        // is pinned BEFORE the next line turns every commit into one.
+        await _pinWriterSynchronousFull();
+        await _enableWriterAutoCheckpoint();
         return;
       }
     }
@@ -427,6 +460,168 @@ class DbasSqlite {
     _readerPoolSize = 0;
     _readerSlotsAvailable = 0;
     _db = await _platform.openDb(fileName);
+  }
+
+  /// Pins the pool writer's fsync policy: `PRAGMA synchronous=FULL`.
+  ///
+  /// **This changes no behaviour.** FULL is already the value — the
+  /// prebuilt C library reports `DEFAULT_SYNCHRONOUS=2` and
+  /// `DEFAULT_WAL_SYNCHRONOUS=2` in `PRAGMA compile_options`, and a live
+  /// readback on the writer measures `synchronous=2`. The pragma is
+  /// issued **deliberately explicitly rather than inherited**: until it
+  /// was, the setting was load-bearing on an undocumented compile-time
+  /// default of a **prebuilt binary**. Nothing in the Dart said so, and
+  /// a future rebuild of that C library with different flags would
+  /// change this database's durability with no code change and no test
+  /// failure. Issuing it costs nothing — it is already the value — and
+  /// puts the intent next to [_enableWriterAutoCheckpoint]'s fold
+  /// policy, where a reader of this file can actually see it.
+  ///
+  /// `synchronous` is a **connection-level** setting applied once at
+  /// open, **never per commit**. It governs the fsync SQLite performs
+  /// both when a transaction commits and when a checkpoint folds the
+  /// WAL back into the main `.db` — which is why it is pinned BEFORE
+  /// [_enableWriterAutoCheckpoint] turns every commit into a
+  /// checkpoint, so no fold can run under an unpinned durability.
+  ///
+  /// A failure is **fatal to the open** and throws
+  /// [DbasSqliteErrorCode.openDbSynchronousFullFailed] — the same policy
+  /// as [_enableWriterAutoCheckpoint], through the shared
+  /// [_applyOpenTimeWriterPragma]: the half-built pool is torn down
+  /// first and the instance is left cleanly not-open.
+  ///
+  /// **Web:** no-op. `web/libs/dbas_sqlite_worker.js` already issues
+  /// `PRAGMA synchronous=FULL` on the writer role during worker init and
+  /// fails pool creation with `INIT_FAILED` if it cannot, so the
+  /// guarantee is established there — same policy, enforced one layer
+  /// down. Mirrors [setBusyTimeout]'s web no-op rationale.
+  Future<void> _pinWriterSynchronousFull() {
+    return _applyOpenTimeWriterPragma(
+      'PRAGMA synchronous=FULL',
+      DbasSqliteErrorCode.openDbSynchronousFullFailed,
+      'The writer would silently fall back to whatever durability the '
+      'prebuilt C library happens to be compiled with — an invisible, '
+      'unpinned default.',
+    );
+  }
+
+  /// Configures the pool's writer connection so **every** commit folds
+  /// the WAL back into the main `.db` file.
+  ///
+  /// Until this pragma runs, the writer inherits SQLite's stock
+  /// `wal_autocheckpoint=1000` and committed frames sit in the `-wal`
+  /// indefinitely: measured, 200 committed inserts leave the main `.db`
+  /// at 4096 bytes with an 832 KB `-wal` and the table not in the main
+  /// file **at all**. Anything that then reads the main file alone — a
+  /// file copy, [streamCopyDb], a backup — silently sees a truncated or
+  /// entirely empty database, with no error of any kind.
+  ///
+  /// `=1` checkpoints after every commit, which covers bare
+  /// `INSERT`/`UPDATE`/`DELETE` too: each is an implicit transaction
+  /// that commits. It is a single statement, so it is unaffected by the
+  /// one-statement limit of the `executeSql` prepare path.
+  ///
+  /// A failure is **fatal to the open** and throws
+  /// [DbasSqliteErrorCode.openDbWalAutoCheckpointFailed]: publishing a
+  /// writer that silently hoards WAL frames is the exact bug this
+  /// pragma exists to prevent, so the half-built pool is torn down
+  /// first — through the shared [_applyOpenTimeWriterPragma] — and the
+  /// instance is left cleanly not-open.
+  ///
+  /// **Web:** no-op. `web/libs/dbas_sqlite_worker.js` already issues
+  /// `PRAGMA wal_autocheckpoint=1` on the writer role during worker
+  /// init and fails pool creation with `INIT_FAILED` if it cannot, so
+  /// the guarantee is established there — same policy, enforced one
+  /// layer down. Mirrors [setBusyTimeout]'s web no-op rationale.
+  Future<void> _enableWriterAutoCheckpoint() {
+    return _applyOpenTimeWriterPragma(
+      'PRAGMA wal_autocheckpoint=1',
+      DbasSqliteErrorCode.openDbWalAutoCheckpointFailed,
+      'Without it, committed data would stay in the -wal and any read of '
+      'the main .db file alone would silently miss it.',
+    );
+  }
+
+  /// Issues one open-time writer [pragma] and makes any failure **fatal
+  /// to the open**: the half-built pool is torn down and [code] is
+  /// thrown, so no caller can ever be handed a writer whose WAL policy
+  /// is unknown.
+  ///
+  /// Shared by [_pinWriterSynchronousFull] and
+  /// [_enableWriterAutoCheckpoint] so both open-time pragmas fail under
+  /// **one** policy instead of two that can drift apart. Each caller
+  /// still names its own [code] and its own [consequence] — the sentence
+  /// spelling out what the writer would silently do if the pragma were
+  /// skipped, which is the part of the thrown message that carries the
+  /// diagnosis.
+  ///
+  /// Order inside this method is **load-bearing**: the SQLite
+  /// diagnostics are captured BEFORE [_tearDownFailedPoolOpen] runs,
+  /// because the teardown nulls [_db] and `getLastDbError` /
+  /// `getErrorCode` / `getUniqueErrorCode` need the live connection to
+  /// reach `sqlite3_errcode` / `sqlite3_extended_errcode`. Keeping the
+  /// capture and the teardown in one method is what stops that ordering
+  /// from being a rule each caller has to remember.
+  ///
+  /// **Web:** no-op — the worker establishes both pragmas itself; see
+  /// the two callers for the per-pragma rationale.
+  Future<void> _applyOpenTimeWriterPragma(
+    String pragma,
+    DbasSqliteErrorCode code,
+    String consequence,
+  ) async {
+    if (kIsWeb) return;
+
+    final rc = await _platform.executeSql(_db!, pragma);
+    if (rc == sqliteOk) return;
+
+    // Load-bearing order: capture BEFORE the teardown nulls `_db`.
+    final err = _platform.getLastDbError(_db!) ?? 'rc=$rc';
+    final primary = _platform.getErrorCode(_db!) ?? rc;
+    final unique = _platform.getUniqueErrorCode(_db!);
+    await _tearDownFailedPoolOpen(pragma);
+    throw DbasSqliteException.sqlite(
+      code,
+      'openDb("$dbName"): $pragma failed on the pool writer: $err. '
+      '$consequence So the open is rejected rather than completed.',
+      sqliteCode: primary,
+      sqliteUniqueCode: unique,
+    );
+  }
+
+  /// Tears the half-built pool down after an open-time writer pragma
+  /// failed, leaving the instance cleanly **not-open**.
+  ///
+  /// Called only by [_applyOpenTimeWriterPragma], which captures the
+  /// SQLite diagnostics (`getLastDbError` / `getErrorCode` /
+  /// `getUniqueErrorCode`) BEFORE handing over — **load-bearing**,
+  /// because this method nulls [_db] and those helpers need the live
+  /// connection to reach `sqlite3_errcode` /
+  /// `sqlite3_extended_errcode`. [pragma] names the statement that
+  /// failed and appears only in the teardown log.
+  ///
+  /// A `closePool` failure here is logged and swallowed: the pragma
+  /// failure is the error the caller is about to throw, and replacing it
+  /// with a teardown failure would bury the real cause.
+  Future<void> _tearDownFailedPoolOpen(String pragma) async {
+    final poolPtr = _poolPtr;
+    if (poolPtr != null) {
+      try {
+        await _platform.closePool(dbName, poolPtr);
+      } catch (e, st) {
+        developer.log(
+          'openDb("$dbName"): closePool during open-failure teardown '
+          'after "$pragma" failed',
+          name: 'dbas_sqlite.DbasSqlite',
+          error: e,
+          stackTrace: st,
+        );
+      }
+    }
+    _poolPtr = null;
+    _db = null;
+    _readerPoolSize = 0;
+    _readerSlotsAvailable = 0;
   }
 
   /// Returns `true` if the database connection is currently open.
@@ -498,6 +693,33 @@ class DbasSqlite {
     }
     _activeStatements.clear();
 
+    // Fold the WAL into the main `.db` file BEFORE the connection goes
+    // away.
+    //
+    // **This ordering is load-bearing**, and a future edit that
+    // reorders any step silently reintroduces the bug it fixes —
+    // committed data that never reaches the main `.db`:
+    //   1. `rollback()` above — a checkpoint issued while a transaction
+    //      is still open folds NOTHING (SQLite refuses to checkpoint a
+    //      connection holding one), so checkpointing before the
+    //      rollback would strand every already-committed frame.
+    //   2. the statement sweep above — an open reader pins a WAL
+    //      snapshot and blocks the fold of every frame above it.
+    //   3. this checkpoint.
+    //   4. `closePool` / `closeDb` below.
+    //
+    // Doing it here rather than leaning on the teardown below is the
+    // whole point: `closePool` does NOT fold (measured — pool writer
+    // plus one other live connection, 200 committed inserts, `closeDb()`
+    // → main 4096 B, `-wal` 832 KB, table absent), and the C-side
+    // `closeDb(checkpoint: true)` flag runs TRUNCATE, which is
+    // unusable here (see its call site below). What normally makes the
+    // default case look healthy is only SQLite's LAST-connection
+    // auto-checkpoint, which disappears the moment anything else still
+    // has the database open.
+    await _checkpointBeforeRawFileAccess('closeDb("$dbName")',
+        takeWriterLock: false);
+
     if (_instance.containsKey(dbName)) {
       _instance.remove(dbName);
     }
@@ -513,6 +735,14 @@ class DbasSqlite {
       // it means at least one handle is still live — either tracked
       // statements that failed to finalise (stmtCloseFailures > 0) or
       // a handle leaked outside our tracking. Surface the right one.
+      //
+      // `checkpoint: false` is deliberate and must stay false: the
+      // C-side flag runs `wal_checkpoint(TRUNCATE)`, which waits out the
+      // whole `busy_timeout` whenever a reader pins the WAL — measured
+      // 5034 ms versus ~0 ms for PASSIVE — and then folds exactly the
+      // same frames. The PASSIVE fold above has already done the real
+      // work on both teardown paths; all TRUNCATE would add is resetting
+      // the `-wal` file length, which no caller here needs.
       final rc = await _platform.closeDb(_db!, checkpoint: false);
       if (rc == sqliteBusy) {
         final err = _platform.getLastDbError(_db!) ?? 'live handles';
@@ -728,6 +958,236 @@ class DbasSqlite {
         sqliteCode: primary,
         sqliteUniqueCode: _platform.getUniqueErrorCode(_db!),
       );
+    }
+  }
+
+  // ── WAL checkpoint ───────────────────────────────────────────────────
+
+  /// Folds committed WAL frames into the main `.db` file and reports
+  /// **exactly how far it got**.
+  ///
+  /// Callers rarely need this: a pooled open sets
+  /// `PRAGMA wal_autocheckpoint=1` on the writer, so every commit — and
+  /// every bare `INSERT`/`UPDATE`/`DELETE`, which is an implicit
+  /// transaction that commits — already folds, and [closeDb] and
+  /// [streamCopyDb] fold on their own. Reach for it when you are about
+  /// to read, copy or ship the main `.db` file **by other means** and
+  /// need to know, not assume, that the data is in there.
+  ///
+  /// Runs `PRAGMA wal_checkpoint(PASSIVE)` on the **writer** connection,
+  /// holding the writer lock for the duration so it cannot interleave
+  /// with an in-flight write. PASSIVE is the only mode that cannot
+  /// stall; see [_runWalCheckpoint] for the measurement behind that.
+  ///
+  /// **An incomplete fold is not an error.** A reader holding a WAL
+  /// snapshot pins every frame above it and no mode can fold those; they
+  /// fold at the next opportunity. That is why this returns a
+  /// [DbasSqliteCheckpointResult] instead of `void` or a `bool`: read
+  /// [DbasSqliteCheckpointResult.isComplete] (`checkpointed == log`) to
+  /// tell a full fold from a partial one.
+  /// [DbasSqliteCheckpointResult.busy] **cannot** tell you that — a
+  /// PASSIVE checkpoint that folds nothing still reports `busy: 0` and
+  /// `SQLITE_OK`.
+  ///
+  /// Throws:
+  ///   - [DbasSqliteErrorCode.checkpointDatabaseNotOpened] — the
+  ///     database is not open.
+  ///   - [DbasSqliteErrorCode.checkpointInsideTransaction] — a
+  ///     transaction is active on this instance. SQLite refuses to
+  ///     checkpoint a connection that holds one, so the call would fold
+  ///     nothing; failing loudly beats returning a zero that looks like
+  ///     a pinned-reader shortfall. Commit or roll back first.
+  ///   - [DbasSqliteErrorCode.checkpointDatabaseClosedWaitingLock] — the
+  ///     database was closed while this call waited for the writer lock.
+  ///   - [DbasSqliteErrorCode.checkpointPrepareFailed] /
+  ///     [DbasSqliteErrorCode.checkpointFailed] — the pragma itself
+  ///     could not be prepared or stepped.
+  Future<DbasSqliteCheckpointResult> checkpoint() async {
+    if (!isOpened()) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.checkpointDatabaseNotOpened,
+        'Database is not opened.',
+      );
+    }
+    if (_isInTransaction) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.checkpointInsideTransaction,
+        'Cannot checkpoint inside a transaction: SQLite refuses to '
+        'checkpoint a connection that holds an open transaction, so the '
+        'call would fold nothing. Commit or roll back first.',
+      );
+    }
+    await _acquireWriterLock();
+    try {
+      if (!isOpened()) {
+        throw DbasSqliteException.dart(
+          DbasSqliteErrorCode.checkpointDatabaseClosedWaitingLock,
+          'Database was closed while waiting for writer lock.',
+        );
+      }
+      return await _runWalCheckpoint();
+    } finally {
+      _releaseWriterLock();
+    }
+  }
+
+  /// Issues `PRAGMA wal_checkpoint(PASSIVE)` on the writer connection
+  /// and parses its single `(busy, log, checkpointed)` row.
+  ///
+  /// The caller MUST already own the writer connection — either holding
+  /// the writer lock ([checkpoint], [streamCopyDb]) or running inside
+  /// [closeDb]'s teardown, where both wait queues have been cancelled
+  /// and no Dart-level holder remains.
+  ///
+  /// **PASSIVE is not a default that may be relaxed.** `TRUNCATE` folds
+  /// exactly the same frames but waits out the entire `busy_timeout`
+  /// first whenever a reader pins the WAL — measured against this
+  /// library, `PASSIVE → (busy: 0, log: 10, checkpointed: 0)` in ~0 ms
+  /// versus `TRUNCATE → (busy: 1, log: 10, checkpointed: 0)` in
+  /// **5034 ms**. All the blocking modes buy is resetting the `-wal`
+  /// file's length; nothing in this library needs that, and every caller
+  /// here sits on a latency budget.
+  ///
+  /// The pragma goes through the prepare/step/finalize path rather than
+  /// `executeSql` because `executeSql` returns only an rc and **discards
+  /// result rows** — and the row is the entire point. The statement is
+  /// deliberately not registered in `_activeStatements`: it is finalized
+  /// in this method's `finally`, and [closeDb] calls this AFTER its
+  /// statement sweep.
+  ///
+  /// Throws [DbasSqliteErrorCode.checkpointPrepareFailed] when the
+  /// pragma cannot be prepared, and [DbasSqliteErrorCode.checkpointFailed]
+  /// when the step yields anything other than a three-column row. An
+  /// **incomplete** fold is not a failure — see
+  /// [DbasSqliteCheckpointResult.isComplete].
+  Future<DbasSqliteCheckpointResult> _runWalCheckpoint() async {
+    const sql = 'PRAGMA wal_checkpoint(PASSIVE)';
+    final conn = _db!;
+    final prep = await _platform.prepareQuery(conn, sql);
+    if (prep.handle == sqliteInvalidStmtHandle) {
+      final err = _platform.getLastDbError(conn) ?? 'unknown error';
+      final primary = _platform.getErrorCode(conn);
+      final msg = 'Failed to prepare "$sql" on the writer connection: $err';
+      throw primary != null
+          ? DbasSqliteException.sqlite(
+              DbasSqliteErrorCode.checkpointPrepareFailed,
+              msg,
+              sqliteCode: primary,
+              sqliteUniqueCode: _platform.getUniqueErrorCode(conn),
+            )
+          : DbasSqliteException.dart(
+              DbasSqliteErrorCode.checkpointPrepareFailed, msg);
+    }
+    try {
+      final cache = RowData();
+      final rc = await _platform.readRowAndCache(conn, prep.handle, cache);
+      final columns = cache.columns;
+      if (rc != sqliteRow || columns == null || columns.length < 3) {
+        final err = _platform.getLastStmtError(conn, prep.handle) ??
+            _platform.getLastDbError(conn) ??
+            'rc=$rc';
+        final primary = _platform.getErrorCode(conn);
+        final msg = '"$sql" produced no (busy, log, checkpointed) row '
+            '(rc=$rc, columns=${columns?.length ?? 0}): $err';
+        throw primary != null
+            ? DbasSqliteException.sqlite(
+                DbasSqliteErrorCode.checkpointFailed,
+                msg,
+                sqliteCode: primary,
+                sqliteUniqueCode: _platform.getUniqueErrorCode(conn),
+              )
+            : DbasSqliteException.dart(
+                DbasSqliteErrorCode.checkpointFailed, msg);
+      }
+      // A database that is NOT in WAL mode reports (0, -1, -1) here —
+      // a legitimate "there was no WAL to fold", which
+      // [DbasSqliteCheckpointResult.isComplete] reads as complete.
+      return DbasSqliteCheckpointResult(
+        busy: toIntSafe(columns[0].value),
+        log: toIntSafe(columns[1].value),
+        checkpointed: toIntSafe(columns[2].value),
+      );
+    } finally {
+      await _platform.finalizeStmt(conn, prep.handle);
+    }
+  }
+
+  /// Best-effort PASSIVE checkpoint for the two paths that are about to
+  /// expose the raw `.db` file — [closeDb] and [streamCopyDb]. **Never
+  /// throws.**
+  ///
+  /// Both outcomes it can report are logged via `dart:developer` rather
+  /// than raised, for different reasons:
+  ///
+  ///   - **Incomplete fold** (`isComplete == false`): not an error at
+  ///     all. A reader pinning a WAL snapshot blocks the frames above
+  ///     it; they fold at the next opportunity and nothing committed is
+  ///     lost. Throwing would turn a recoverable, self-healing state
+  ///     into a failed [closeDb] / [streamCopyDb], and retrying is
+  ///     pointless — no checkpoint mode can fold a pinned frame, and
+  ///     the blocking ones burn the whole `busy_timeout` proving it.
+  ///   - **Outright failure**: [closeDb] must reach `closePool` no
+  ///     matter what, exactly as it already does for a failed
+  ///     `rollback()` or a failed statement close — aborting teardown
+  ///     would leak the pool, the instance-cache entry and OS handles,
+  ///     which is strictly worse than an unfolded WAL that the next
+  ///     open will fold anyway.
+  ///
+  /// **Silence is what caused this class of bug**, so every non-ideal
+  /// outcome is logged with the triple and its consequence spelled out.
+  /// Callers that need a hard guarantee have [checkpoint], which
+  /// reports through its return value instead.
+  ///
+  /// [takeWriterLock] is `false` only from [closeDb], where `_closing`
+  /// is already latched — [_acquireWriterLock] rejects outright at that
+  /// point, and it does not need to be held: [closeDb] has already
+  /// cancelled both wait queues, so no Dart-level holder remains.
+  Future<void> _checkpointBeforeRawFileAccess(
+    String context, {
+    required bool takeWriterLock,
+  }) async {
+    if (!isOpened()) return;
+    if (_isInTransaction) {
+      developer.log(
+        '$context: skipped the WAL checkpoint — a transaction is still '
+        'open and SQLite refuses to checkpoint a connection holding one. '
+        'Committed frames may remain in the -wal, so a read of the main '
+        '.db file alone can be missing them.',
+        name: 'dbas_sqlite.DbasSqlite',
+      );
+      return;
+    }
+    var lockHeld = false;
+    try {
+      if (takeWriterLock) {
+        await _acquireWriterLock();
+        lockHeld = true;
+      }
+      final result = await _runWalCheckpoint();
+      if (!result.isComplete) {
+        developer.log(
+          '$context: WAL checkpoint folded ${result.checkpointed} of '
+          '${result.log} frame(s) (busy=${result.busy}). A reader is '
+          'holding a WAL snapshot, so the remaining frames stay in the '
+          '-wal and fold at the next opportunity — committed data is NOT '
+          'lost, but a copy of the main .db file alone would be missing '
+          'them right now.',
+          name: 'dbas_sqlite.DbasSqlite',
+        );
+      }
+    } catch (e, st) {
+      developer.log(
+        '$context: WAL checkpoint failed; continuing. Committed frames '
+        'may still be in the -wal.',
+        name: 'dbas_sqlite.DbasSqlite',
+        error: e,
+        stackTrace: st,
+      );
+    } finally {
+      // Only release what we actually took — a failed acquire never
+      // held the lock, and releasing it would hand the lock to a queued
+      // waiter nobody will ever release it for.
+      if (lockHeld) _releaseWriterLock();
     }
   }
 

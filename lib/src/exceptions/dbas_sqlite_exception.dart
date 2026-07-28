@@ -19,6 +19,13 @@ enum DbasSqliteErrorCode {
   // DbasSqlite — WAL
   enableWalDatabaseNotOpened,
   enableWalFailed,
+  openDbSynchronousFullFailed,
+  openDbWalAutoCheckpointFailed,
+  checkpointDatabaseNotOpened,
+  checkpointInsideTransaction,
+  checkpointDatabaseClosedWaitingLock,
+  checkpointPrepareFailed,
+  checkpointFailed,
 
   // DbasSqlite — transactions
   beginTransactionDatabaseNotOpened,
@@ -113,6 +120,8 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.commitDatabaseNotOpened:
       case DbasSqliteErrorCode.vacuumDatabaseNotOpened:
       case DbasSqliteErrorCode.vacuumDatabaseClosedWaitingLock:
+      case DbasSqliteErrorCode.checkpointDatabaseNotOpened:
+      case DbasSqliteErrorCode.checkpointDatabaseClosedWaitingLock:
       case DbasSqliteErrorCode.statementClosed:
       case DbasSqliteErrorCode.statementDatabaseNotOpened:
       case DbasSqliteErrorCode.acquireReaderConnectionNoPool:
@@ -130,10 +139,17 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
 
       case DbasSqliteErrorCode.executeSqlPrepareFailed:
       case DbasSqliteErrorCode.executeReaderPrepareFailed:
+      case DbasSqliteErrorCode.checkpointPrepareFailed:
         return DbasSqliteErrorCategory.prepareFailed;
 
       case DbasSqliteErrorCode.executeSqlStepFailed:
       case DbasSqliteErrorCode.readRowFailed:
+      // `PRAGMA wal_checkpoint` is stepped as a statement (its
+      // `(busy, log, checkpointed)` row is the whole point), so a
+      // failure here is a step failure like any other — NOT the
+      // `transactionFailed` bucket `vacuumFailed` sits in, which covers
+      // one-shot `executeSql` transaction verbs.
+      case DbasSqliteErrorCode.checkpointFailed:
         return DbasSqliteErrorCategory.executeFailed;
 
       case DbasSqliteErrorCode.bindPositionalFailed:
@@ -156,6 +172,10 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.transactionRollbackAlsoFailed:
       case DbasSqliteErrorCode.vacuumInsideTransaction:
       case DbasSqliteErrorCode.vacuumFailed:
+      // Joins `vacuumInsideTransaction`: same "wrong time to call this"
+      // shape, and the root cause is the transaction state, not the
+      // checkpoint itself.
+      case DbasSqliteErrorCode.checkpointInsideTransaction:
         return DbasSqliteErrorCategory.transactionFailed;
 
       case DbasSqliteErrorCode.readerAlreadyActive:
@@ -168,6 +188,12 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
         return DbasSqliteErrorCategory.decodeFailed;
 
       case DbasSqliteErrorCode.openDbReopenWithDifferentPoolSize:
+      // All three are openDb-path failures with no dedicated category
+      // and no consumer-side recovery beyond "the open failed"; the two
+      // pragma ones should be unreachable in practice — they are pure
+      // connection settings with no I/O.
+      case DbasSqliteErrorCode.openDbSynchronousFullFailed:
+      case DbasSqliteErrorCode.openDbWalAutoCheckpointFailed:
         return DbasSqliteErrorCategory.internal;
     }
   }
