@@ -1,6 +1,6 @@
 name: dbas_sqlite
 description: "Flutter plugin that access SQLite for Android, iOS, macOS, Linux, Windows and Web."
-version: 2.8.3
+version: 2.8.4
 homepage: https://github.com/dailysoftwaresystems/dbas_sqlite
 author_name: Daily Software Systems
 author_email: dailysoftwaresystems@dailysoftwaresystems.com
