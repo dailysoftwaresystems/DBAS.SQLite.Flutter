@@ -38,6 +38,21 @@ import 'package:dbas_sqlite/src/exceptions/dbas_sqlite_exception.dart';
 /// Closing the statement closes any active reader. Closing the owning
 /// [DbasSqlite] auto-closes every still-open statement.
 class DbasSqliteStatement {
+  /// Test-only rendezvous inside `executeReader`'s prepare window —
+  /// after the pool reader and the native statement handle have been
+  /// acquired, but before ownership is transferred to the
+  /// [DbasSqliteReader] that `_activeReader` points at. `null` in
+  /// production; the awaited call is the only cost when it is set.
+  ///
+  /// Exists because that window is the one stretch of `executeReader`
+  /// no other seam can observe: the read is already holding native
+  /// resources, yet `_activeReader` is still `null`, so [close] — and
+  /// therefore `closeDb`'s statement sweep — sees nothing to await.
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static,
+  /// so a leaked hook would park every later test's first read.
+  @visibleForTesting
+  static Future<void> Function()? debugBeforeReaderTransfer;
+
   final DbasSqlite _db;
   final DbasSqlitePlatform _platform;
   final String _sql;
@@ -290,6 +305,13 @@ class DbasSqliteStatement {
     // autocommit mode and survive the rollback silently. See
     // [DbasSqlite.rollback]. Both calls run in this same synchronous
     // turn, so no other flow can observe an untracked registration.
+    //
+    // The native-operation registration joins that same synchronous
+    // turn. It is deliberately NOT taken around the writer-lock acquire
+    // above: a caller merely parked on the Dart-side FIFO queue has not
+    // reached native code, and `closeDb` rejects it through
+    // `_cancelWriterWaitQueue` rather than waiting for it.
+    final nativeOp = _db.beginNativeOpInternal(_nativeOpLabel('executeSql'));
     final dispatch = _executeSqlDispatch();
     if (reentrantOp != null) {
       _db.trackReentrantWriterOpDispatchInternal(reentrantOp, dispatch);
@@ -302,6 +324,7 @@ class DbasSqliteStatement {
       } else {
         _db.releaseWriterLockInternal();
       }
+      _db.endNativeOpInternal(nativeOp);
     }
   }
 
@@ -569,6 +592,52 @@ class DbasSqliteStatement {
   }
 
   Future<DbasSqliteReader> _executeReaderNative() async {
+    // Register with the connection-wide native-operation registry HERE:
+    // synchronously, before the first `await`, and — the load-bearing
+    // part — before the routing decision immediately below.
+    //
+    // Everything after this line acquires native resources that no other
+    // tracked owner can see until `_activeReader` is assigned near the
+    // end: a checked-out pool reader (or the writer connection) plus a
+    // live `sqlite3_stmt`. A `closeDb()` arriving while this method is
+    // suspended anywhere in that window finds `_activeReader == null`,
+    // so `close()` awaits nothing and the statement sweep disowns the
+    // statement outright — after which the POOL route deadlocks
+    // (`ClosePool` waits on a reader nobody will release) and the WRITER
+    // route corrupts memory (the writer is not checkout-tracked, so
+    // `ClosePool` force-closes it under this live handle). ONE
+    // registration above the branch is what covers both by construction;
+    // registering per-route would leave whichever route was written
+    // second silently uncovered. See [DbasSqlite.beginNativeOpInternal].
+    final nativeOp = _db.beginNativeOpInternal(_nativeOpLabel('executeReader'));
+    try {
+      return await _executeReaderRouted();
+    } finally {
+      // Un-registered LAST — after the inner `finally` has either handed
+      // ownership to `_activeReader` (which `closeDb`'s statement sweep
+      // can find and close) or unwound everything it acquired. Ending it
+      // any earlier would let teardown proceed over a pool reader that
+      // has not been returned yet.
+      _db.endNativeOpInternal(nativeOp);
+    }
+  }
+
+  /// Registry label for an in-flight native operation on this statement.
+  /// Carries the SQL — truncated, since
+  /// [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout] names every
+  /// outstanding label and a script can be arbitrarily long — so the
+  /// diagnostic says WHICH call never handed back, not just what kind.
+  String _nativeOpLabel(String verb) {
+    final sql = _sql.length <= 80 ? _sql : '${_sql.substring(0, 77)}...';
+    return '$verb($sql)';
+  }
+
+  /// The connection-routing, prepare, bind and reader-handoff body of
+  /// [executeReader]. Split out of [_executeReaderNative] so the
+  /// native-operation registration can wrap it whole — including the
+  /// routing decision, which is what makes the pool and writer routes
+  /// covered by the same registration.
+  Future<DbasSqliteReader> _executeReaderRouted() async {
     // Use the writer connection only after a write has happened in the
     // current transaction (read-your-writes). Before any writes — or
     // outside a transaction — go through the pool so parallel reads
@@ -644,6 +713,10 @@ class DbasSqliteStatement {
       }
 
       await _replayBinds(conn, handle);
+
+      // Test-only rendezvous — see [debugBeforeReaderTransfer].
+      final beforeReaderTransfer = debugBeforeReaderTransfer;
+      if (beforeReaderTransfer != null) await beforeReaderTransfer();
 
       final reader = DbasSqliteReader.internal(
         conn: conn,
@@ -761,6 +834,17 @@ class DbasSqliteStatement {
   /// column of the first row is SQL NULL. The returned dynamic is
   /// typed by the column's SQLite type: `int` for INTEGER, `double`
   /// for FLOAT, `String` for TEXT, [Uint8List] for BLOB.
+  ///
+  /// **`null` means "no row / SQL NULL", and nothing else.** This method
+  /// runs one [DbasSqliteReader.readRow], so it inherits that method's
+  /// teardown contract: if the reader is torn down between
+  /// [executeReader] returning and that first `readRow` — a
+  /// [DbasSqlite.closeDb] statement sweep, or a [close] on this
+  /// statement from elsewhere — the `readRow` throws
+  /// [DbasSqliteErrorCode.readerClosedDuringScan] and this method
+  /// throws it on, instead of reporting the empty result `null` would
+  /// claim. Before 2.9.0 that case returned `null`, indistinguishable
+  /// from a genuinely empty query.
   ///
   /// Closes both the underlying reader and this statement before
   /// returning, so the statement is single-use — calling any execute

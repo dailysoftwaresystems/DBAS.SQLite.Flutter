@@ -2,6 +2,301 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.9.0 - 2026-07-30
+
+**A `closeDb()`-safety release.** Teardown destroys a connection, a pool
+and every `sqlite3_stmt` hanging off them, and it was doing that while
+live calls were still inside native code holding exactly those
+resources. Two independent blind spots, one lifecycle step apart, and
+neither was reachable from the other's fix:
+
+  - a read still inside `executeReader`'s **prepare window** — it holds a
+    connection and a statement but is not yet a reader, so the statement
+    sweep cannot see it at all; and
+  - a read that already **is** a reader, suspended in `readRow()` with a
+    step dispatched against its statement — the sweep sees it, and
+    finalizes the handle out from under the step.
+
+Both are fixed below. The second one changes what a consumer observes
+when a scan is cut short, deliberately — see **Changed**.
+
+### Fixed
+
+- **`closeDb()` could walk straight past a read that was already inside
+  native code — deadlocking on the pool route and corrupting memory on
+  the writer route.** One blind spot, two consequences, decided only by
+  which connection the read had been routed to.
+
+  `closeDb`'s statement sweep relies on `stmt.close()`, and
+  `DbasSqliteStatement.close()` awaits the active reader — but
+  `_activeReader` is not assigned until the very end of
+  `executeReader`. A read suspended anywhere between acquiring its
+  connection and that assignment therefore has `_activeReader == null`,
+  so `close()` returned having awaited **nothing** while already
+  latching `_closed`, and `_activeStatements.clear()` then disowned the
+  statement outright. The read was holding a checked-out pool reader
+  (or the writer) and a live `sqlite3_stmt` the whole time.
+
+  What happened next depended on the route, and both outcomes were
+  fatal. On a **pool reader**: nothing ever called `PoolReleaseReader`
+  for it — the caller's own `finally { await stmt.close(); }` hit
+  `if (_closed) return` and cascaded to nothing — so `ClosePool`, which
+  blocks until every checked-out reader is back, waited forever and
+  `closeDb()` never returned. On the **writer** (read-your-writes:
+  inside a transaction, after a write — the shape a migration produces)
+  there was no such protection at all: the C header is explicit that
+  *"the writer is NOT checkout-tracked (it has no release call)"*, so
+  `ClosePool` proceeded and force-closed it through
+  `closeDbCore(force=true)`, finalizing the live `sqlite3_stmt` and
+  freeing the `SQLiteDb`. The reader `executeReader` then handed its
+  caller pointed at freed memory, and the next `readRow()` / `close()`
+  on it was a SIGSEGV that kills the process rather than raising
+  anything catchable.
+
+  `rollback()` did not cover it either: its drain waits only on
+  operations that registered a **dispatch**, and reads deliberately
+  register none.
+
+  A fix covering only the pool route would clear the deadlock and leave
+  the segfault fully alive, so the routes are now covered **by
+  construction rather than by two parallel special cases**: a
+  connection-wide native-operation registry, with the read's
+  registration taken at `executeReader`'s entry — synchronously, before
+  the first `await`, and above the `useWriter` routing branch. One
+  registration, both routes, and a future third route inherits the
+  cover automatically. `closeDb()` drains that registry after
+  `rollback()` and **before** the statement sweep; the ordering is
+  load-bearing in both directions, because the drain returns once each
+  operation has handed its resources to an owner the sweep can find,
+  and the sweep is what then closes the reader and returns its pool
+  connection.
+
+  The registry generalises the existing, already-proven
+  `_ReentrantWriterOp` machinery, which solves "wait for work that
+  crossed into native code" for the rollback case but is scoped to
+  reentrant *writer* operations and therefore never saw the pool reads
+  at all. `executeSql`, `executeScript`, `beginTransaction`, `commit`,
+  `rollback`, `vacuum`, `enableWal`, `checkpoint()` and
+  `setBusyTimeout`'s reader loop register too. There are exactly two
+  documented exemptions, and each is covered by something else:
+
+    1. the PASSIVE checkpoint `closeDb` runs on its way out
+       (`takeWriterLock: false`, which already means "I am teardown")
+       is reached only *after* the drain, so registering it would make
+       teardown wait on itself; and
+    2. `DbasSqliteReader.readRow` — covered instead by the reader's own
+       step drain, added in the next entry, which is where the reason
+       it cannot register is spelled out.
+
+- **`closeDb()` finalized a `sqlite3_stmt` while the reader that owns it
+  had a step in flight against that exact handle.** The sibling of the
+  blind spot above, one step later in the same lifecycle: there the read
+  had not become a reader yet and the casualty was the *connection*
+  under it; here it **is** a reader — `_activeReader` points at it and
+  the sweep can see it — and the casualty is the *statement* inside it.
+  Pre-existing, and not something the registry above covers.
+
+  A consumer suspended in `await reader.readRow()` is a worker-isolate
+  dispatch against a live `sqlite3_stmt`. `readRow` registers nothing
+  with the native-operation registry, so `_drainNativeOps` finds it
+  empty and `closeDb` walks straight into its statement sweep:
+  `stmt.close()` → `reader.close()` → `onClose` → `finalizeStmt`, on the
+  handle the step is using. `_dispatch` picks the least-loaded worker,
+  so the step and the finalize genuinely land on **two different OS
+  threads**.
+
+  The C layer neither refuses nor blocks — it corrupts. `FinalizeStmt`
+  has no busy check, no refcount and no step-in-progress flag; `ReadRow`
+  resolves the pointer, **drops `db_stmts_lock`**, then runs
+  `sqlite3_step` and writes `s->affectedRows` / `lastInsertedId` /
+  `lastError` unlocked. `resolve_stmt`'s own contract says the pointer
+  is stable only *"so long as the caller does NOT concurrently
+  FinalizeStmt the same handle from another thread."* Widening the C
+  lock is off-design — `db_stmts_lock` is documented as held only
+  briefly and never across a step. And `SQLitePool.activeOps` protects
+  the **connection**, not the **statement**, so the pool-route
+  protection above buys nothing here: the reader *is* checked out and
+  *will* be released; the corruption is on the statement inside it,
+  before release.
+
+  **The reader now serialises its own teardown against its own steps.**
+  `readRow` publishes the step it dispatched before suspending on it,
+  and `close()` waits for every published step — ignoring their results,
+  which belong to `readRow` — before it lets `onClose` finalize
+  anything. That covers every route by construction, for every caller:
+  an explicit `reader.close()`, `DbasSqliteStatement.close()`,
+  `executeScalar`'s `finally`, and `closeDb`'s sweep all funnel through
+  the one method. `closeDb` waits for the steps, exactly as it already
+  waits for one dispatch anywhere else.
+
+  The published steps are held in a **set, not a single slot**. Nothing
+  rejects two un-awaited `readRow` calls on one reader, and a single
+  slot would be overwritten by the second — leaving the first still
+  inside `sqlite3_step`, referenced by nothing, and finalized out from
+  under it by a `close()` that believed it had drained. That is the same
+  `FinalizeStmt`-under-`sqlite3_step` corruption, reached *through* the
+  fix, and `_dispatch` picks the least-loaded worker with no per-handle
+  affinity, so the two steps do not even share an OS thread. Concurrent
+  `readRow` on one reader remains a useless shape — the calls race the
+  row cache, so each may read the other's row — but nothing rejects it,
+  so it must not be able to corrupt memory.
+
+  Extending the native-operation registry to cover `readRow` was
+  rejected rather than overlooked: an open cursor would register a fresh
+  operation per row, which breaks the drain's termination invariant
+  ("`_closing` is latched, so no new operation can register") by
+  construction, blocks `closeDb` for a whole table scan, and makes
+  self-deadlock newly reachable from any `closeDb()` issued inside a
+  `readRow` loop. The wait added here is unbounded on purpose: a timeout
+  could only expire into finalizing the handle anyway, and throwing
+  instead would leave `onClose` unrun — statement never finalized, pool
+  reader never released — which wedges `ClosePool` just as hard with
+  less information. Unbounded is not allowed to mean silent, though, so
+  the wait logs how long it has been waiting and for how many steps
+  every `DbasSqliteReader.kStepDrainStallReportMs` (5 s) until they hand
+  back — the one wait in the library that no timeout will ever surface.
+
+- **`closeDb()` handed pointers that were mid-free back into FFI.**
+  `closePool` / `closeDb` are dispatched to a worker isolate, so the
+  main isolate keeps running across them — and anything reading `_db` /
+  `_poolPtr` in that window (`isOpened()`, `getTotalChanges()`, a
+  reader release) called straight into native code with a pointer the C
+  side was in the middle of destroying. Both fields are now captured
+  into locals and nulled **before** the destructive dispatch is
+  awaited, so a concurrent caller observes a closed connection — a
+  state it already handles — instead of a freed one.
+
+### Changed
+
+- **`closeDb()` now blocks until the connection is quiescent, and can
+  throw.** Callers merely parked in Dart are still rejected outright,
+  but an operation already inside native code cannot be recalled, so it
+  is waited for. In practice: `closeDb()` on a database with an
+  un-awaited call still in flight now takes as long as that call does,
+  instead of racing it. That wait — the **native-operation registry
+  drain**, which is the one this bullet is about — is bounded by
+  `DbasSqlite.kNativeOpDrainTimeoutMs` (30 s).
+
+  On expiry it **throws** the new
+  `DbasSqliteErrorCode.closeDbNativeOpDrainTimeout`
+  (category `busyOrCancelled`, alongside the two existing `closeDbBusy*`
+  codes), naming the operations still outstanding, and leaves the
+  connection open. Logging and proceeding was rejected rather than
+  overlooked: the next steps free the connection those operations are
+  still using, so continuing *is* the use-after-free. Failing the close
+  leaks a handle, which keeps the process alive and the failure
+  diagnosable — and the remedy is simply to await the outstanding work
+  and call `closeDb()` again.
+
+  **That 30 s ceiling bounds the registry drain, not `closeDb()`.** The
+  statement sweep runs *after* the drain and closes every open reader,
+  and a reader waits for its own in-flight `readRow` steps
+  **unboundedly** — see the second **Fixed** entry for why a timeout
+  there could only expire into the corruption it prevents. So a
+  `closeDb()` on a connection with a parked reader step blocks for as
+  long as that step takes, with no ceiling at all; what it does instead
+  of failing is log a stall report every
+  `DbasSqliteReader.kStepDrainStallReportMs` (5 s).
+
+- **A `DbasSqliteReader` torn down mid-scan now THROWS instead of
+  reporting exhaustion — `readRow()` returning `false` means "no more
+  rows", and now means nothing else.** Previously `close()` set a flag
+  and the next `readRow()` returned `false` at its guard, so a scan cut
+  short by teardown was indistinguishable from one that ran out of rows.
+  A `while (await readRow())` loop building a list handed its caller a
+  **silently truncated result with no error of any kind** — the exact
+  failure mode this library's own docs condemn elsewhere.
+
+  `readRow()` (and therefore `readRows()`, which is a plain loop over it)
+  now throws `DbasSqliteErrorCode.readerClosedDuringScan` when the reader
+  was closed for any reason other than running out of rows: an explicit
+  `reader.close()`, a `DbasSqliteStatement.close()`, `closeDb`'s
+  statement sweep, or an earlier failed step. Exhaustion — and only
+  exhaustion — still answers `false`, so every correct loop keeps
+  working unchanged. The throw happens at the guard, before any contact
+  with the finalized handle.
+
+  A consumer suspended in `readRow()` at the moment of teardown still
+  receives the row its step already produced (it was read before
+  anything was torn down, and the row cache is pure Dart); its **next**
+  `readRow()` is the one that throws.
+
+  **`executeScalar()` inherits this**, and it is the one place where the
+  new throw replaces a `null` rather than a `false`. It runs a single
+  `readRow()`, so a reader torn down between `executeReader` returning
+  and that first step now makes it throw `readerClosedDuringScan` where
+  it previously returned `null` — indistinguishable, until now, from a
+  query that genuinely matched no rows. `null` from `executeScalar()`
+  now means "no row, or SQL NULL", and nothing else.
+
+  **Consumer impact, accepted rather than softened.** In `dbas_base_app`,
+  `watchSelectListFromType` and `batchWatchSelectListFromType` run their
+  `readRow` loop *outside* the shared reader slot, and their rationale
+  block calls it *"a bounded, uninterruptible drain"* — an assumption
+  this change deliberately breaks under teardown. The live shape is
+  **logout while a list view is mid-scan** (`Authentication.logout` →
+  `Database.closeDb`, which never cancels outstanding watch streams).
+  Such a consumer now gets an **error event** instead of a silently
+  truncated list. That is the intended trade: a stream that fails loudly
+  during shutdown is recoverable; a list that is quietly missing rows is
+  not, and cannot even be detected.
+
+### Added
+
+- **`DbasSqlite.debugInFlightNativeOpCount`** (`@visibleForTesting`) —
+  how many operations are currently registered as inside native code.
+  The invariant this release rests on is that `closeDb` reaches its
+  destructive dispatch only once this is zero, and there is no other way
+  to observe that from outside.
+
+- **`DbasSqlite.debugNativeOpDrainTimeoutMs`** (`@visibleForTesting`) —
+  test-only override for `kNativeOpDrainTimeoutMs`, so the drain-timeout
+  path can be exercised in milliseconds. Same shape and same caveats as
+  `debugWriterLockWaitTimeoutMs`.
+
+- **`DbasSqlite.debugBeforeDestructiveClose`** (`@visibleForTesting`) —
+  synchronous observation point invoked at the exact instant `closeDb`
+  is about to dispatch `closePool` / `closeDb`, i.e. the last moment the
+  ordering above can still be checked.
+
+- **`DbasSqliteStatement.debugBeforeReaderTransfer`**
+  (`@visibleForTesting`) — test-only rendezvous inside `executeReader`'s
+  prepare window. That window is the one stretch of the call no other
+  seam can observe: native resources are already held, yet
+  `_activeReader` is still `null`.
+
+- **`DbasSqliteErrorCode.readerClosedDuringScan`** — raised by
+  `readRow()` / `readRows()` on a reader that was closed before its
+  result set was exhausted. Category `busyOrCancelled`, alongside
+  `readerSlotWaitCancelled` and `writerLockWaitCancelled`: nothing about
+  the reader's lifecycle was misused, an in-progress scan was cut short
+  by something else, and the remedy is the same — stop iterating. See
+  **Changed** for what it replaced.
+
+- **`DbasSqliteReader.debugInsideReadRowStep`** (`@visibleForTesting`) —
+  test-only rendezvous inside `readRow`'s step window, after the native
+  step has been dispatched against a live `sqlite3_stmt` and before
+  `readRow` consumes its result. That window is the one stretch of a
+  reader's life no other seam can observe: `isClosed` is still `false`,
+  the row cache still holds the previous row, and the parent statement's
+  `_activeReader` has pointed at it since `executeReader` returned. It
+  composes *into* the step future rather than sitting beside it, so
+  "this reader has a step outstanding" stays true for exactly as long as
+  the hook parks. Do **not** await a close of the reader from inside the
+  hook: the close waits for the hook, so the hook waiting for the close
+  deadlocks — unboundedly, and visible only through the stall report
+  below.
+
+- **`DbasSqliteReader.kStepDrainStallReportMs`** (5000) — how often
+  `close()` logs that it is still waiting for an in-flight `readRow`
+  step. It does not bound the wait; it exists so the one wait in this
+  library that no timeout will ever surface is at least diagnosable.
+  **`DbasSqliteReader.debugStepDrainStallReportMs`**
+  (`@visibleForTesting`) overrides it in milliseconds, and
+  **`DbasSqliteReader.debugStepDrainStallReports`**
+  (`@visibleForTesting`) counts the reports emitted by that reader,
+  since a `developer.log` side effect has no other observable.
+
 ## 2.8.4 - 2026-07-28
 
 ### Added

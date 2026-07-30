@@ -49,6 +49,39 @@ class _ReentrantWriterOp {
   Future<void>? dispatch;
 }
 
+/// Opaque handle for one operation that has crossed from Dart into
+/// native code, handed out by [DbasSqlite.beginNativeOpInternal] and
+/// given back to [DbasSqlite.endNativeOpInternal].
+///
+/// Carries only the operation's process-unique `id` — a record rather
+/// than a bare `int` so it cannot be confused with the pointers and
+/// handles this class passes around. The registration's label lives on
+/// the registry entry, which is what
+/// [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout] reads; nothing
+/// needs it here. No `generation` either, unlike
+/// [ReentrantWriterOpToken]: this registry is not scoped to a
+/// transaction, so there is no epoch a token could outlive.
+typedef NativeOpToken = ({int id});
+
+/// One registered operation that is inside native code and holds native
+/// resources no other tracked owner can see yet — a checked-out pool
+/// reader, a live `sqlite3_stmt`, an in-flight worker dispatch. Lives in
+/// `DbasSqlite._nativeOps` between [DbasSqlite.beginNativeOpInternal]
+/// and [DbasSqlite.endNativeOpInternal].
+class _NativeOp {
+  _NativeOp(this.label);
+
+  /// What is in flight, for the drain-timeout diagnostic.
+  final String label;
+
+  /// Completed — **never** with an error — by
+  /// [DbasSqlite.endNativeOpInternal]. `_drainNativeOps` awaits this
+  /// instead of polling, so an operation that hands back wakes the drain
+  /// immediately, and the drain can never inherit a failure that the
+  /// operation's real caller is already awaiting.
+  final Completer<void> done = Completer<void>();
+}
+
 /// A cross-platform SQLite database wrapper for Flutter.
 ///
 /// Provides a unified API to interact with SQLite databases on
@@ -104,6 +137,17 @@ class DbasSqlite {
   /// [DbasSqliteErrorCode.writerLockWaitTimeout] instead.
   static const int kWriterLockWaitTimeoutMs = 30000;
 
+  /// Deadline for [closeDb]'s wait on operations that already crossed
+  /// into native code (see [beginNativeOpInternal]). Sized like the two
+  /// waits above because it covers the same worst case: a dispatch
+  /// queued behind a busy worker isolate.
+  ///
+  /// Reaching it is a bug in the calling code — an operation was still
+  /// running when the database was closed and never handed back — so it
+  /// surfaces as [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout]
+  /// rather than letting teardown proceed over live native resources.
+  static const int kNativeOpDrainTimeoutMs = 30000;
+
   /// Test-only override for [kPoolAcquireTimeoutMs]. Setting this in
   /// production code is a smell; the field exists so timeout-path
   /// tests complete in milliseconds.
@@ -123,6 +167,27 @@ class DbasSqlite {
   /// leaked override would shorten every later test's writer wait.
   @visibleForTesting
   static int? debugWriterLockWaitTimeoutMs;
+
+  /// Test-only override for [kNativeOpDrainTimeoutMs]. Same rationale as
+  /// [debugPoolAcquireTimeoutMs] — the drain-timeout test would
+  /// otherwise pause for 30 s on every run. Reset it to `null` in a
+  /// `finally`; it is static, so a leaked override would shorten every
+  /// later test's teardown wait.
+  @visibleForTesting
+  static int? debugNativeOpDrainTimeoutMs;
+
+  /// Test-only observation point, invoked **synchronously** by [closeDb]
+  /// immediately before it dispatches the destructive `closePool` /
+  /// `closeDb` call — i.e. at the exact instant the native connection
+  /// stops being safe to touch.
+  ///
+  /// Exists so a test can assert the ordering invariant this release is
+  /// built on ([debugInFlightNativeOpCount] is zero by then) at the only
+  /// moment where it matters. Synchronous by construction: teardown must
+  /// not gain a suspension point that production code does not have.
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static.
+  @visibleForTesting
+  static void Function(DbasSqlite db)? debugBeforeDestructiveClose;
 
   static final Map<String, DbasSqlite> _instance = {};
 
@@ -162,6 +227,24 @@ class DbasSqlite {
   /// [_rotateReentrantWriterOpEpoch] whenever a transaction starts or
   /// ends — see [endReentrantWriterOpInternal].
   int _transactionGeneration = 0;
+
+  /// Every operation currently inside NATIVE code on this connection,
+  /// keyed by the operation id inside [NativeOpToken]. Registered by
+  /// [beginNativeOpInternal] and drained by [closeDb] via
+  /// [_drainNativeOps].
+  ///
+  /// Deliberately wider than [_reentrantWriterOps], which the writer-lock
+  /// machinery uses to answer "may this transaction COMMIT?" and
+  /// therefore only ever tracks writer users inside a transaction. This
+  /// one is connection-wide and route-blind — a pool read outside any
+  /// transaction registers here too — because the question teardown asks
+  /// is different: "is anything still holding native resources?"
+  final Map<int, _NativeOp> _nativeOps = {};
+
+  /// Source of process-unique ids for [_nativeOps]. Ids are never
+  /// reused, so a token can only ever match the one operation it was
+  /// handed out for.
+  int _nativeOpSeq = 0;
 
   int? _poolPtr;
   /// Reader count requested at openDb time; used by
@@ -691,6 +774,28 @@ class DbasSqlite {
   /// the cache. Active readers and statements are closed first.
   /// Active transactions are rolled back.
   ///
+  /// **Blocks until the connection is quiescent.** Callers that are only
+  /// parked in Dart are rejected outright ([_closing], plus the two
+  /// wait-queue cancellations), but an operation that has already
+  /// crossed into native code cannot be recalled — it is waited for, via
+  /// [_drainNativeOps]. That drain is bounded by
+  /// [kNativeOpDrainTimeoutMs]; on expiry this method **throws**
+  /// [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout] and leaves the
+  /// connection open rather than destroying it under live native work.
+  /// That is a real behaviour change: `closeDb()` on a database with an
+  /// un-awaited call still in flight now takes as long as that call
+  /// does, instead of racing it.
+  ///
+  /// **[kNativeOpDrainTimeoutMs] bounds that drain, not this method.**
+  /// The statement sweep that runs after it closes every open reader,
+  /// and [DbasSqliteReader.close] waits for that reader's in-flight
+  /// `readRow` steps **unboundedly** — see its docs for why a timeout
+  /// there could only expire into the corruption it exists to prevent.
+  /// So `closeDb()` on a connection with a parked reader step blocks for
+  /// as long as that step takes, with no ceiling; the reader logs a
+  /// stall report every [DbasSqliteReader.kStepDrainStallReportMs]
+  /// instead of failing.
+  ///
   /// If the in-flight `rollback()` itself fails (e.g. the connection
   /// is already in a corrupt state at the SQLite layer), the failure
   /// is logged via `dart:developer` and teardown continues — otherwise
@@ -735,6 +840,42 @@ class DbasSqlite {
       );
     }
 
+    // Wait for every operation that already crossed into NATIVE code to
+    // hand back — BEFORE the statement sweep below.
+    //
+    // The `_closing` latch and the two queue cancellations above stop
+    // everything that has not started; neither can recall a call that is
+    // already inside the C pool. The reachable case is a read suspended
+    // anywhere in `executeReader`'s prepare window: it has been handed a
+    // connection and has a live `sqlite3_stmt`, yet `_activeReader` is
+    // still null — so the sweep's `stmt.close()` would await NOTHING
+    // while latching `_closed`, and `_activeStatements.clear()` would
+    // then disown it outright. What happens next is decided only by
+    // which connection the read was routed to, and both outcomes are
+    // fatal:
+    //   - POOL reader: nothing ever calls `PoolReleaseReader` for it, so
+    //     `ClosePool` — which blocks until every checked-out reader is
+    //     back — waits forever and `closeDb` never returns.
+    //   - WRITER (read-your-writes: inside a transaction, after a
+    //     write): the writer is NOT checkout-tracked on the C side, so
+    //     `ClosePool` proceeds and force-closes it via
+    //     `closeDbCore(force=true)`, finalizing the live `sqlite3_stmt`
+    //     and freeing the `SQLiteDb`. The reader `executeReader` then
+    //     hands its caller points at freed memory.
+    // One registration at `executeReader`'s entry — before its routing
+    // decision — is what covers both by construction rather than by two
+    // parallel special cases.
+    //
+    // **Before the sweep, not after**, and that ordering is as
+    // load-bearing as the checkpoint ordering below: the drain returns
+    // once each operation has handed its resources to an owner this
+    // method can find, which for a read that got far enough is the
+    // `_activeReader` on its STILL-TRACKED statement. The sweep is what
+    // then closes it. Drain after the sweep instead and that reader
+    // hangs off a statement the sweep has already disowned — nothing
+    // closes it, and on the pool route nothing releases its reader.
+    await _drainNativeOps();
+
     // Close every still-open statement (which closes its active reader
     // if any). List.of() snapshots the set since close() mutates it.
     int stmtCloseFailures = 0;
@@ -763,10 +904,13 @@ class DbasSqlite {
     //      is still open folds NOTHING (SQLite refuses to checkpoint a
     //      connection holding one), so checkpointing before the
     //      rollback would strand every already-committed frame.
-    //   2. the statement sweep above — an open reader pins a WAL
+    //   2. the native-operation drain above — a read still in
+    //      `executeReader`'s prepare window is not yet an open reader,
+    //      so the sweep in step 3 cannot see it at all.
+    //   3. the statement sweep above — an open reader pins a WAL
     //      snapshot and blocks the fold of every frame above it.
-    //   3. this checkpoint.
-    //   4. `closePool` / `closeDb` below.
+    //   4. this checkpoint.
+    //   5. `closePool` / `closeDb` below.
     //
     // Doing it here rather than leaning on the teardown below is the
     // whole point: `closePool` does NOT fold (measured — pool writer
@@ -784,12 +928,31 @@ class DbasSqlite {
       _instance.remove(dbName);
     }
 
-    if (_poolPtr != null) {
+    // Capture the handles into locals and null the fields BEFORE
+    // awaiting the destructive dispatch below.
+    //
+    // Both `closePool` and `closeDb` run on a worker isolate, so this
+    // method is suspended across them while the MAIN isolate keeps
+    // running. Anything that reads `_db` / `_poolPtr` in that window —
+    // `isOpened()`, `getTotalChanges()`, `releaseReaderConnectionInternal`,
+    // all of which call straight into FFI — would otherwise hand a
+    // pointer the C side is in the middle of freeing back into a native
+    // call. Nulled first, those callers see a CLOSED connection, which
+    // is a state they already handle, instead of a freed one.
+    final poolPtr = _poolPtr;
+    final conn = _db;
+    _poolPtr = null;
+    _db = null;
+
+    // Invoked here, after the nulling and before the dispatch, so a test
+    // observes the state teardown is actually about to run under.
+    final debugHook = debugBeforeDestructiveClose;
+    if (debugHook != null) debugHook(this);
+
+    if (poolPtr != null) {
       // ClosePool force-drains any handles we missed (defensive).
-      await _platform.closePool(dbName, _poolPtr!);
-      _poolPtr = null;
-      _db = null;
-    } else if (_db != null) {
+      await _platform.closePool(dbName, poolPtr);
+    } else if (conn != null) {
       // Single-connection fallback. Tracked statements above should
       // have finalised every handle; if CloseDb returns SQLITE_BUSY
       // it means at least one handle is still live — either tracked
@@ -803,16 +966,16 @@ class DbasSqlite {
       // same frames. The PASSIVE fold above has already done the real
       // work on both teardown paths; all TRUNCATE would add is resetting
       // the `-wal` file length, which no caller here needs.
-      final rc = await _platform.closeDb(_db!, checkpoint: false);
+      final rc = await _platform.closeDb(conn, checkpoint: false);
       if (rc == sqliteBusy) {
-        final err = _platform.getLastDbError(_db!) ?? 'live handles';
-        // Capture both rcs BEFORE nulling _db — the helpers need the
-        // live connection to call sqlite3_errcode / sqlite3_extended_errcode.
-        // Fall back to the observed `rc` when the helpers return null
-        // (the C lib didn't queue an active error on the connection).
-        final primaryRc = _platform.getErrorCode(_db!) ?? rc;
-        final uniqueRc = _platform.getUniqueErrorCode(_db!);
-        _db = null;
+        // `conn` is still a VALID pointer here: the strict close path
+        // refuses (force=false) rather than freeing when a handle is
+        // live, so the diagnostics below read a connection that is very
+        // much alive. Fall back to the observed `rc` when the helpers
+        // return null (the C lib didn't queue an active error on it).
+        final err = _platform.getLastDbError(conn) ?? 'live handles';
+        final primaryRc = _platform.getErrorCode(conn) ?? rc;
+        final uniqueRc = _platform.getUniqueErrorCode(conn);
         if (stmtCloseFailures > 0) {
           throw DbasSqliteException.sqlite(
             DbasSqliteErrorCode.closeDbBusyWithStmtFinalizeFailures,
@@ -832,7 +995,6 @@ class DbasSqlite {
           sqliteUniqueCode: uniqueRc,
         );
       }
-      _db = null;
     }
   }
 
@@ -937,65 +1099,77 @@ class DbasSqlite {
       // model — there is nothing to do.
       return;
     }
-    final rc = await _platform.setBusyTimeout(_db!, ms);
-    if (rc != sqliteOk) {
-      final err = _platform.getLastDbError(_db!) ?? 'rc=$rc';
-      final primary = _platform.getErrorCode(_db!) ?? rc;
-      throw DbasSqliteException.sqlite(
-        DbasSqliteErrorCode.setBusyTimeoutWriterFailed,
-        'setBusyTimeout failed on writer: $err',
-        sqliteCode: primary,
-        sqliteUniqueCode: _platform.getUniqueErrorCode(_db!),
-      );
-    }
-
-    if (_poolPtr == null || _readerPoolSize == 0) return;
-
-    // Hold all reader slots exclusively, then reconfigure each one
-    // exactly once. Acquiring all up front prevents the same slot
-    // from being reconfigured multiple times in a release-then-
-    // re-acquire cycle. Release happens in the `finally` so a mid-
-    // loop failure doesn't leak slots.
-    final acquireMs =
-        debugSetBusyTimeoutAcquireMs ?? kSetBusyTimeoutAcquireMs;
-    final delegate = _platform.delegate(dbName);
-    final acquired = <int>[];
+    // This method checks readers out of the C pool DIRECTLY, bypassing
+    // the Dart-side reader-slot semaphore, so it is invisible to every
+    // other teardown signal — the registration is the only thing that
+    // stops a `closeDb` from calling `ClosePool` while slots are held
+    // here. It wraps the whole method (the writer pragma included) and
+    // is released by the OUTER `finally`, i.e. after every
+    // `poolReleaseReader` below has run.
+    final nativeOp = beginNativeOpInternal('setBusyTimeout');
     try {
-      for (int i = 0; i < _readerPoolSize; i++) {
-        final acquire =
-            await delegate.poolAcquireReaderBlocking(_poolPtr!, acquireMs);
-        if (acquire.readerPtr == 0) {
-          if (acquire.status == PoolAcquireStatus.closing) {
+      final rc = await _platform.setBusyTimeout(_db!, ms);
+      if (rc != sqliteOk) {
+        final err = _platform.getLastDbError(_db!) ?? 'rc=$rc';
+        final primary = _platform.getErrorCode(_db!) ?? rc;
+        throw DbasSqliteException.sqlite(
+          DbasSqliteErrorCode.setBusyTimeoutWriterFailed,
+          'setBusyTimeout failed on writer: $err',
+          sqliteCode: primary,
+          sqliteUniqueCode: _platform.getUniqueErrorCode(_db!),
+        );
+      }
+
+      if (_poolPtr == null || _readerPoolSize == 0) return;
+
+      // Hold all reader slots exclusively, then reconfigure each one
+      // exactly once. Acquiring all up front prevents the same slot
+      // from being reconfigured multiple times in a release-then-
+      // re-acquire cycle. Release happens in the `finally` so a mid-
+      // loop failure doesn't leak slots.
+      final acquireMs =
+          debugSetBusyTimeoutAcquireMs ?? kSetBusyTimeoutAcquireMs;
+      final delegate = _platform.delegate(dbName);
+      final acquired = <int>[];
+      try {
+        for (int i = 0; i < _readerPoolSize; i++) {
+          final acquire =
+              await delegate.poolAcquireReaderBlocking(_poolPtr!, acquireMs);
+          if (acquire.readerPtr == 0) {
+            if (acquire.status == PoolAcquireStatus.closing) {
+              throw DbasSqliteException.dart(
+                DbasSqliteErrorCode.readerSlotWaitCancelled,
+                'setBusyTimeout was cancelled: the database is closing.',
+              );
+            }
             throw DbasSqliteException.dart(
-              DbasSqliteErrorCode.readerSlotWaitCancelled,
-              'setBusyTimeout was cancelled: the database is closing.',
+              DbasSqliteErrorCode.setBusyTimeoutReaderBusy,
+              'setBusyTimeout: pool reader $i was busy for '
+              '${acquireMs}ms — close in-flight readers first.',
             );
           }
-          throw DbasSqliteException.dart(
-            DbasSqliteErrorCode.setBusyTimeoutReaderBusy,
-            'setBusyTimeout: pool reader $i was busy for '
-            '${acquireMs}ms — close in-flight readers first.',
-          );
+          acquired.add(acquire.readerPtr);
         }
-        acquired.add(acquire.readerPtr);
-      }
-      for (final readerPtr in acquired) {
-        final readerDb = DbasSqliteDb(dbName, readerPtr);
-        final rrc = await _platform.setBusyTimeout(readerDb, ms);
-        if (rrc != sqliteOk) {
-          final primary = _platform.getErrorCode(readerDb) ?? rrc;
-          throw DbasSqliteException.sqlite(
-            DbasSqliteErrorCode.setBusyTimeoutReaderFailed,
-            'setBusyTimeout failed on a pool reader: rc=$rrc',
-            sqliteCode: primary,
-            sqliteUniqueCode: _platform.getUniqueErrorCode(readerDb),
-          );
+        for (final readerPtr in acquired) {
+          final readerDb = DbasSqliteDb(dbName, readerPtr);
+          final rrc = await _platform.setBusyTimeout(readerDb, ms);
+          if (rrc != sqliteOk) {
+            final primary = _platform.getErrorCode(readerDb) ?? rrc;
+            throw DbasSqliteException.sqlite(
+              DbasSqliteErrorCode.setBusyTimeoutReaderFailed,
+              'setBusyTimeout failed on a pool reader: rc=$rrc',
+              sqliteCode: primary,
+              sqliteUniqueCode: _platform.getUniqueErrorCode(readerDb),
+            );
+          }
+        }
+      } finally {
+        for (final readerPtr in acquired) {
+          delegate.poolReleaseReader(_poolPtr!, readerPtr);
         }
       }
     } finally {
-      for (final readerPtr in acquired) {
-        delegate.poolReleaseReader(_poolPtr!, readerPtr);
-      }
+      endNativeOpInternal(nativeOp);
     }
   }
 
@@ -1072,20 +1246,30 @@ class DbasSqlite {
         'Commit or roll back first.',
       );
     }
-    final rc = await _platform.enableWal(writer);
-    if (rc != sqliteOk) {
-      final err = _platform.getLastDbError(writer) ?? 'rc=$rc';
-      final primary = _platform.getErrorCode(writer) ?? rc;
-      throw DbasSqliteException.sqlite(
-        DbasSqliteErrorCode.enableWalFailed,
-        'enableWal failed: $err',
-        sqliteCode: primary,
-        sqliteUniqueCode: _platform.getUniqueErrorCode(writer),
-      );
+    // Covers the journal-mode switch AND the writer-policy pragmas that
+    // follow it — both are dispatches on the live writer connection, and
+    // a teardown that slipped between them would leave the database in
+    // WAL under an unpinned fold policy on a connection being freed.
+    final nativeOp = beginNativeOpInternal('enableWal');
+    try {
+      final rc = await _platform.enableWal(writer);
+      if (rc != sqliteOk) {
+        final err = _platform.getLastDbError(writer) ?? 'rc=$rc';
+        final primary = _platform.getErrorCode(writer) ?? rc;
+        throw DbasSqliteException.sqlite(
+          DbasSqliteErrorCode.enableWalFailed,
+          'enableWal failed: $err',
+          sqliteCode: primary,
+          sqliteUniqueCode: _platform.getUniqueErrorCode(writer),
+        );
+      }
+      // Only reached once the connection really is in WAL, so the policy
+      // always lands on a journal mode that has something for it to
+      // govern.
+      await _pinWalWriterSettings(writer, caller: 'enableWal');
+    } finally {
+      endNativeOpInternal(nativeOp);
     }
-    // Only reached once the connection really is in WAL, so the policy
-    // always lands on a journal mode that has something for it to govern.
-    await _pinWalWriterSettings(writer, caller: 'enableWal');
   }
 
   // ── WAL checkpoint ───────────────────────────────────────────────────
@@ -1145,6 +1329,7 @@ class DbasSqlite {
       );
     }
     await _acquireWriterLock();
+    final nativeOp = beginNativeOpInternal('checkpoint');
     try {
       if (!isOpened()) {
         throw DbasSqliteException.dart(
@@ -1155,6 +1340,7 @@ class DbasSqlite {
       return await _runWalCheckpoint();
     } finally {
       _releaseWriterLock();
+      endNativeOpInternal(nativeOp);
     }
   }
 
@@ -1269,6 +1455,16 @@ class DbasSqlite {
   /// is already latched — [_acquireWriterLock] rejects outright at that
   /// point, and it does not need to be held: [closeDb] has already
   /// cancelled both wait queues, so no Dart-level holder remains.
+  ///
+  /// **`takeWriterLock: false` is also the one native call in this class
+  /// that deliberately does NOT register with [beginNativeOpInternal].**
+  /// It is reachable only from [closeDb], *after* that method's
+  /// [_drainNativeOps] — registering would make teardown wait on itself,
+  /// forever. `takeWriterLock: false` already means "I am teardown", so
+  /// the exemption rides on the flag that already carries that meaning
+  /// rather than on a second one that could drift away from it.
+  /// (`DbasSqliteReader.readRow` is also unregistered, for an unrelated
+  /// reason — [_drainNativeOps] lists both.)
   Future<void> _checkpointBeforeRawFileAccess(
     String context, {
     required bool takeWriterLock,
@@ -1285,10 +1481,13 @@ class DbasSqlite {
       return;
     }
     var lockHeld = false;
+    NativeOpToken? nativeOp;
     try {
       if (takeWriterLock) {
         await _acquireWriterLock();
         lockHeld = true;
+        // Registered on this path only — see the [takeWriterLock] docs.
+        nativeOp = beginNativeOpInternal('checkpoint($context)');
       }
       final result = await _runWalCheckpoint();
       if (!result.isComplete) {
@@ -1313,7 +1512,9 @@ class DbasSqlite {
     } finally {
       // Only release what we actually took — a failed acquire never
       // held the lock, and releasing it would hand the lock to a queued
-      // waiter nobody will ever release it for.
+      // waiter nobody will ever release it for. Same for the
+      // registration, which only exists on the `takeWriterLock` path.
+      if (nativeOp != null) endNativeOpInternal(nativeOp);
       if (lockHeld) _releaseWriterLock();
     }
   }
@@ -1413,6 +1614,10 @@ class DbasSqlite {
     }
 
     await _acquireWriterLock();
+    // Registered after the lock is granted, not before: a caller still
+    // parked on the FIFO queue has not reached native code, and
+    // `closeDb` rejects it through `_cancelWriterWaitQueue` instead.
+    final nativeOp = beginNativeOpInternal('beginTransaction');
     try {
       if (!isOpened()) {
         throw DbasSqliteException.dart(
@@ -1438,6 +1643,8 @@ class DbasSqlite {
     } catch (_) {
       if (!_isInTransaction) _releaseWriterLock();
       rethrow;
+    } finally {
+      endNativeOpInternal(nativeOp);
     }
   }
 
@@ -1545,6 +1752,7 @@ class DbasSqlite {
     // failed", so the transaction is left completely untouched and the
     // caller can retry once the blocker is gone.
     _assertNoInFlightWriterUsers();
+    final nativeOp = beginNativeOpInternal('commit');
     try {
       final rc = await _platform.executeSql(_db!, 'COMMIT');
       if (rc != sqliteOk) {
@@ -1610,6 +1818,11 @@ class DbasSqlite {
         Error.throwWithStackTrace(ex, originalStack);
       }
       rethrow;
+    } finally {
+      // The recovery `rollback()` in the catch above registers its own
+      // operation and ends it before this line is reached, so the two
+      // nest cleanly rather than sharing a registration.
+      endNativeOpInternal(nativeOp);
     }
   }
 
@@ -1666,6 +1879,10 @@ class DbasSqlite {
     int? rollbackPrimaryRc;
     int? rollbackUniqueRc;
     String rollbackDetail = '';
+    // `closeDb` calls this BEFORE its native-operation drain, so the
+    // registration here is always ended before that drain starts — it
+    // can never wait on itself.
+    final nativeOp = beginNativeOpInternal('rollback');
     try {
       final rc = await _platform.executeSql(_db!, 'ROLLBACK');
       if (rc != sqliteOk) {
@@ -1689,6 +1906,7 @@ class DbasSqlite {
       _startedCurrentTransaction = false;
       _rotateReentrantWriterOpEpoch();
       _releaseWriterLock();
+      endNativeOpInternal(nativeOp);
     }
     if (rollbackCauseStack != null) {
       final msg =
@@ -1896,6 +2114,9 @@ class DbasSqlite {
     // the writer connection.
     final lockHeld = _isInTransaction;
     ReentrantWriterOpToken? reentrantOp;
+    // Assigned at the dispatch below, not here: everything before it is
+    // a Dart-side wait, which `closeDb` cancels rather than drains.
+    NativeOpToken? nativeOp;
     if (lockHeld) {
       reentrantOp = beginReentrantWriterOpInternal();
     } else {
@@ -1920,6 +2141,7 @@ class DbasSqlite {
       // issuing ROLLBACK on top of it. Registration, mark and dispatch
       // all run in this one synchronous turn, so no other flow can
       // observe a half-registered script.
+      nativeOp = beginNativeOpInternal('executeScript');
       final dispatch = _platform.executeSql(conn, sql);
       if (reentrantOp != null) {
         trackReentrantWriterOpDispatchInternal(reentrantOp, dispatch);
@@ -1944,6 +2166,7 @@ class DbasSqlite {
       } else {
         _releaseWriterLock();
       }
+      if (nativeOp != null) endNativeOpInternal(nativeOp);
     }
   }
 
@@ -1966,6 +2189,7 @@ class DbasSqlite {
       );
     }
     await _acquireWriterLock();
+    final nativeOp = beginNativeOpInternal('vacuum');
     try {
       if (!isOpened()) {
         throw DbasSqliteException.dart(
@@ -1986,6 +2210,7 @@ class DbasSqlite {
       }
     } finally {
       _releaseWriterLock();
+      endNativeOpInternal(nativeOp);
     }
   }
 
@@ -2240,6 +2465,148 @@ class DbasSqlite {
       if (pending.isEmpty) return;
       await Future.wait(pending);
     }
+  }
+
+  // ── Native-operation registry ────────────────────────────────────────
+
+  /// Registers an operation that is crossing from Dart into NATIVE code
+  /// and will hold native resources no other tracked owner can see — a
+  /// checked-out pool reader, a live `sqlite3_stmt`, an in-flight worker
+  /// dispatch on the writer.
+  ///
+  /// [closeDb] drains this registry ([_drainNativeOps]) before it folds
+  /// the WAL and destroys the connection. **That drain is the only thing
+  /// covering work which is already past every Dart-side gate.**
+  /// [_closing] rejects operations that have not started, and
+  /// [_cancelReaderSlotWaitQueue] / [_cancelWriterWaitQueue] reject the
+  /// ones parked in Dart — but nothing on the Dart side can recall a
+  /// call that is already inside the C pool.
+  ///
+  /// [label] should name the call (and, for a statement, its SQL): it is
+  /// what [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout] reports.
+  ///
+  /// **Pair every call with exactly one [endNativeOpInternal] in a
+  /// `finally`, and un-register only once the operation's native
+  /// resources have either been released or handed to an owner [closeDb]
+  /// can find** — the tracked statement's `_activeReader` for a read
+  /// that completed, the returned pool reader for one that bailed out.
+  /// Un-registering any earlier reopens the exact window this registry
+  /// exists to close.
+  NativeOpToken beginNativeOpInternal(String label) {
+    final id = ++_nativeOpSeq;
+    _nativeOps[id] = _NativeOp(label);
+    return (id: id);
+  }
+
+  /// Un-registers the operation [token] identifies and wakes any
+  /// [_drainNativeOps] parked on it. An unknown token is ignored, so a
+  /// double un-registration is a harmless no-op.
+  ///
+  /// No epoch match here, unlike [endReentrantWriterOpInternal]: this
+  /// registry is not scoped to a transaction and ids are never reused,
+  /// so a late un-registration can only ever match the one operation it
+  /// was handed out for.
+  void endNativeOpInternal(NativeOpToken token) {
+    final op = _nativeOps.remove(token.id);
+    if (op == null || op.done.isCompleted) return;
+    op.done.complete();
+  }
+
+  /// Number of operations currently registered as in flight inside
+  /// native code. Test-only seam: the invariant this release rests on is
+  /// that [closeDb] reaches its destructive `closePool` / `closeDb`
+  /// dispatch only once this is zero, and there is no other way to
+  /// observe that from outside.
+  @visibleForTesting
+  int get debugInFlightNativeOpCount => _nativeOps.length;
+
+  /// Waits until nothing is inside native code any more.
+  ///
+  /// **Loops rather than awaiting one snapshot**, for the same reason
+  /// [_drainReentrantWriterOps] does: an operation that hands back can
+  /// let another one through, and draining "everything that was in
+  /// flight when we started" would leave exactly the one that arrived
+  /// last un-drained. Each operation clears itself from [_nativeOps] as
+  /// it ends, so the loop makes strict progress.
+  ///
+  /// A caller resuming from the operation that just handed back wins the
+  /// race against [closeDb]'s statement sweep, so an `executeReader` that
+  /// returned successfully during teardown delivers an OPEN reader and
+  /// the sweep closes it afterwards. That falls out of the shapes rather
+  /// than being enforced: waking this drain costs strictly more hops
+  /// (`Future.wait` → deadline → loop → return → [closeDb] resumes) than
+  /// returning through `executeReader` does. It is a real property — a
+  /// reader closed before its caller's first `readRow()` would report an
+  /// empty result set with no error at all — so it is pinned by a test
+  /// rather than left to be rediscovered; a change that inverts the
+  /// ordering fails there instead of silently shipping.
+  ///
+  /// **Two native calls deliberately stay out of this registry, and both
+  /// are covered by something else — a third would not be.**
+  ///
+  ///   1. The PASSIVE checkpoint [closeDb] runs on its way out
+  ///      (`_checkpointBeforeRawFileAccess(takeWriterLock: false)`) is
+  ///      reached only *after* this drain, so registering it would make
+  ///      teardown wait on itself, forever.
+  ///   2. `DbasSqliteReader.readRow` — a step dispatched against a live
+  ///      `sqlite3_stmt`, which is exactly the shape this registry
+  ///      exists for. It stays out because a reader IS a tracked owner:
+  ///      the statement sweep below finds it through `_activeReader` and
+  ///      closes it, and `DbasSqliteReader.close` waits for its own
+  ///      outstanding step before letting `onClose` finalize the handle.
+  ///      Registering per row would also break the termination invariant
+  ///      stated below by construction — an open cursor would register a
+  ///      fresh operation for every row, so "no new operation can
+  ///      register" would stop holding and this drain would block for a
+  ///      whole table scan rather than for work already in native code.
+  ///
+  /// Termination is not assumed: [_closing] is latched before the first
+  /// call, so no new operation can register, and every parked Dart-side
+  /// waiter was already error-completed. It is bounded anyway by
+  /// [kNativeOpDrainTimeoutMs] ([debugNativeOpDrainTimeoutMs] in tests).
+  ///
+  /// **On expiry it THROWS**
+  /// [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout], naming the
+  /// outstanding labels, and teardown stops there. Logging and
+  /// proceeding is not an option and is not a milder one: the very next
+  /// steps free the connection those operations are still using, so
+  /// continuing IS the use-after-free. Failing the close leaks a handle,
+  /// which is strictly better — the process stays alive, the error names
+  /// what wedged it, and [closeDb] can simply be called again once the
+  /// outstanding work finishes.
+  Future<void> _drainNativeOps() async {
+    if (_nativeOps.isEmpty) return;
+    final timeoutMs = debugNativeOpDrainTimeoutMs ?? kNativeOpDrainTimeoutMs;
+    final elapsed = Stopwatch()..start();
+    while (true) {
+      final pending = <Future<void>>[
+        for (final op in _nativeOps.values) op.done.future,
+      ];
+      if (pending.isEmpty) return;
+      final remaining = timeoutMs - elapsed.elapsedMilliseconds;
+      if (remaining <= 0) throw _nativeOpDrainTimeout(timeoutMs);
+      try {
+        await Future.wait(pending).timeout(Duration(milliseconds: remaining));
+      } on TimeoutException {
+        throw _nativeOpDrainTimeout(timeoutMs);
+      }
+    }
+  }
+
+  /// The [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout] failure, built
+  /// from whatever is still registered at the moment it is raised.
+  DbasSqliteException _nativeOpDrainTimeout(int timeoutMs) {
+    final outstanding = _nativeOps.values.map((op) => op.label).join('; ');
+    return DbasSqliteException.dart(
+      DbasSqliteErrorCode.closeDbNativeOpDrainTimeout,
+      'closeDb("$dbName") timed out after ${timeoutMs}ms waiting for '
+      '${_nativeOps.length} operation(s) still inside native code: '
+      '$outstanding. Teardown was ABORTED rather than continued — the '
+      'next step destroys the connection those operations are still '
+      'using, so proceeding would free memory they are about to touch. '
+      'The connection is left open and still marked closing; await every '
+      'in-flight call, then call closeDb() again.',
+    );
   }
 
   /// Forgets every still-registered reentrant operation and moves the

@@ -7,6 +7,7 @@ enum DbasSqliteErrorCode {
   // DbasSqlite — lifecycle
   closeDbBusyWithStmtFinalizeFailures,
   closeDbBusyLeakedHandle,
+  closeDbNativeOpDrainTimeout,
   prepareQueryDatabaseNotOpened,
   openDbReopenWithDifferentPoolSize,
 
@@ -78,6 +79,7 @@ enum DbasSqliteErrorCode {
 
   // DbasSqliteReader
   readRowFailed,
+  readerClosedDuringScan,
   invalidDecimalFormat,
   invalidTimeFormat,
   invalidTimeComponent,
@@ -140,12 +142,25 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
 
       case DbasSqliteErrorCode.closeDbBusyWithStmtFinalizeFailures:
       case DbasSqliteErrorCode.closeDbBusyLeakedHandle:
+      // Joins the two `closeDbBusy*` codes rather than `notOpened`: all
+      // three mean "teardown could not proceed because something was
+      // still using the connection", and the remedy is the same — let
+      // the outstanding work finish, then close again.
+      case DbasSqliteErrorCode.closeDbNativeOpDrainTimeout:
       case DbasSqliteErrorCode.setBusyTimeoutReaderBusy:
       case DbasSqliteErrorCode.readerSlotWaitTimeout:
       case DbasSqliteErrorCode.readerSlotWaitCancelled:
       case DbasSqliteErrorCode.writerLockWaitCancelled:
       case DbasSqliteErrorCode.writerLockWaitTimeout:
       case DbasSqliteErrorCode.executeReaderPoolAcquireTimeout:
+      // Sibling of the two `*WaitCancelled` codes rather than a
+      // `readerStateFailed` one: nothing about the reader's lifecycle was
+      // misused — an in-progress scan was cut short by something else
+      // (usually `closeDb`'s statement sweep), which is the same shape and
+      // the same remedy as a cancelled slot/lock wait. Grouped here even
+      // though the throw site lives in [DbasSqliteReader], because callers
+      // branch on the CATEGORY to decide "give up, we are shutting down".
+      case DbasSqliteErrorCode.readerClosedDuringScan:
         return DbasSqliteErrorCategory.busyOrCancelled;
 
       case DbasSqliteErrorCode.executeSqlPrepareFailed:

@@ -32,6 +32,8 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
 - Reads within a transaction use the writer connection to see uncommitted data
 - Readers must be closed explicitly via `reader.close()` (or auto-closed when `readRow()` returns `false`) before the connection can be reused
 - `closeDb()` automatically closes all active readers, then releases all locks and unblocks any pending operations -- no risk of use-after-free on lingering readers
+- Closing a reader **waits for every in-flight `readRow()` step** before finalizing the statement, so `closeDb()` can never finalize a `sqlite3_stmt` a step is still running against (the C layer neither refuses nor blocks that -- it corrupts). A consumer mid-scan when this happens keeps the row its step already produced, and its next `readRow()` throws `readerClosedDuringScan` rather than reporting a truncated list as a complete one. This wait is **unbounded** -- a timeout could only expire into the corruption it prevents -- so it is not covered by the `kNativeOpDrainTimeoutMs` ceiling below; the reader logs a stall report every `DbasSqliteReader.kStepDrainStallReportMs` (5 s) instead
+- `closeDb()` also **waits** for any operation that has already crossed into native code, since neither the closing flag nor the wait-queue cancellations can recall one. Callers parked in Dart are still rejected immediately. In practice: closing a database with an un-awaited call still in flight takes as long as that call does. The wait is bounded by `kNativeOpDrainTimeoutMs` (30 s), after which `closeDb()` throws `closeDbNativeOpDrainTimeout` and leaves the connection **open** rather than destroying it under live native work -- await the outstanding work and call `closeDb()` again
 
 ### Background FFI Worker (Native)
 - All heavy FFI operations (`executeSql`, `prepareQuery`, `readRow`, `openDb`, `closeDb`) run on a dedicated background isolate
@@ -47,7 +49,7 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
 - **Lifecycle**
   - `getInstance(dbName:)` - Get singleton instance for a database
   - `openDb({readerPoolSize})` - Open database with connection pool
-  - `closeDb()` - Close database connection (automatically closes all active readers, rolls back any open transaction, then folds the WAL into the main `.db` file)
+  - `closeDb()` - Close database connection (rolls back any open transaction, waits for work already inside native code, closes all active readers, then folds the WAL into the main `.db` file)
   - `isOpened()` - Check connection status
   - `getAppDatabasePath()` - Get platform-specific database path
   - `databaseExists()` - Check if the database file exists
@@ -75,7 +77,7 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
   - `isInTransaction` - Check if a transaction is currently active
 
 ### Data Retrieval (`DbasSqliteReader`)
-- `readRow()` - Advance to next row (`true` if available, `false` and auto-closes when done)
+- `readRow()` - Advance to next row (`true` if available, `false` and auto-closes when done). **`false` means "no more rows" and nothing else**: a reader closed for any other reason -- an explicit `close()`, a `DbasSqliteStatement.close()`, `closeDb()`'s statement sweep, or an earlier failed step -- throws `readerClosedDuringScan` instead, so a scan cut short by teardown can never be mistaken for one that ran out of rows
 - `readRows([amount = 50])` - Read up to `amount` rows in one call. Returns a record `({rows, hasMore})` where `rows` is `List<Map<String, ColumnData>>` (column name → typed `ColumnData`) and `hasMore` is the result of the last `readRow` (`true` = more rows may follow, `false` = result set exhausted)
 - `close()` - Manually close the reader and release its connection
 - **Column Access** (with nullable variants)
@@ -103,7 +105,7 @@ Add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  dbas_sqlite: ^2.8.4
+  dbas_sqlite: ^2.9.0
 ```
 
 Or install with the Dart CLI:
