@@ -5849,12 +5849,24 @@ void main() async {
     // latched _closing flag so its own unwind releases the reader.
     final db = await _createTestDb('pool_close_inflight_prepare_window.db',
         readerPoolSize: 2);
-    addTearDown(() => DbasSqliteStatement.debugBeforeReaderTransfer = null);
+    addTearDown(() {
+      DbasSqliteStatement.debugBeforeReaderTransfer = null;
+      DbasSqlite.debugBeforeDestructiveClose = null;
+    });
     final release = Completer<void>();
     var closeReturned = false;
+    Object? closeOutcome;
     try {
       await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
       await _runSql(db, "INSERT INTO t VALUES (1, 'first')");
+
+      // The witness the unwedge branch at the bottom is gated on: once
+      // this has fired, teardown is at or past the point where the pool
+      // stops being safe to touch.
+      var destructiveCloseReached = false;
+      DbasSqlite.debugBeforeDestructiveClose = (_) {
+        destructiveCloseReached = true;
+      };
 
       // A rendezvous, not a sleep: `reached` proves the read is parked
       // at the offending instruction rather than merely likely to be.
@@ -5879,7 +5891,7 @@ void main() async {
       final close = db
           .closeDb()
           .whenComplete(() => closeReturned = true)
-          .then<Object?>((_) => null, onError: (Object e) => e);
+          .then<Object?>((_) => null, onError: (Object e) => closeOutcome = e);
 
       // While the read is still parked, closeDb must not settle. Pumped
       // with real event-loop turns, not microtask drains: every closeDb
@@ -5909,17 +5921,28 @@ void main() async {
         closeCompleted = false;
       }
 
-      if (!closeCompleted) {
-        // Unwedge before asserting. closePool is still blocked, which
-        // proves the pool — and this orphaned reader — are still alive,
-        // so releasing it here is safe and is what lets teardown
-        // finish. Only safe on this branch: once closeDb HAS completed
-        // the pool is gone and touching the reader would itself be the
-        // use-after-free.
+      if (!closeCompleted && !destructiveCloseReached) {
+        // Unwedge before asserting — but only behind a POSITIVE witness
+        // that the pool is still there to talk to. "Did not settle in 5 s"
+        // is not that witness: it is equally consistent with a closeDb
+        // wedged INSIDE or AFTER closePool, and running finalizeStmt /
+        // poolReleaseReader against a pool mid-destruction is the very
+        // SIGSEGV this test exists to observe without triggering — and a
+        // dead runner reports nothing. `debugBeforeDestructiveClose` not
+        // having fired means teardown has not reached the point of no
+        // return, so the pool, this reader and its connection are all
+        // still alive and releasing it is what lets teardown finish.
         if (readOutcome is DbasSqliteReader && !readOutcome.isClosed) {
           await readOutcome.close();
         }
-        await close;
+        // Bounded like the first wait: an unwedge that does not work must
+        // still fail this test rather than wedge the suite behind it.
+        try {
+          await close.timeout(const Duration(seconds: 5));
+          closeCompleted = true;
+        } on TimeoutException {
+          closeCompleted = false;
+        }
       }
 
       expect(closeCompleted, isTrue,
@@ -5927,11 +5950,14 @@ void main() async {
               'a statement whose read was still in the prepare window, so '
               'the pool reader that read checked out is never released '
               'and closePool waits on activeOps forever');
+      expect(closeOutcome, isNull,
+          reason: 'closeDb must complete, not merely settle');
       expect(readSettled, isTrue,
           reason: 'the parked read must settle once released, whichever '
               'way closeDb went');
     } finally {
       DbasSqliteStatement.debugBeforeReaderTransfer = null;
+      DbasSqlite.debugBeforeDestructiveClose = null;
       // Unpark the read on the failing path too, so a thrown expect
       // cannot leave it suspended into the next test.
       if (!release.isCompleted) release.complete();
@@ -5983,6 +6009,7 @@ void main() async {
     addTearDown(() => DbasSqliteStatement.debugBeforeReaderTransfer = null);
     final release = Completer<void>();
     var closeReturned = false;
+    Object? closeOutcome;
     try {
       await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
       await _runSql(db, "INSERT INTO t VALUES (1, 'first')");
@@ -6023,7 +6050,7 @@ void main() async {
       final close = db
           .closeDb()
           .whenComplete(() => closeReturned = true)
-          .then<Object?>((_) => null, onError: (Object e) => e);
+          .then<Object?>((_) => null, onError: (Object e) => closeOutcome = e);
 
       // Same pumping rationale as the pool case: real event-loop turns,
       // exits the instant closeDb settles.
@@ -6077,6 +6104,8 @@ void main() async {
       expect(closeCompleted, isTrue,
           reason: 'closeDb neither completed while parked nor after the '
               'read was released');
+      expect(closeOutcome, isNull,
+          reason: 'closeDb must complete, not merely settle');
     } finally {
       DbasSqliteStatement.debugBeforeReaderTransfer = null;
       if (!release.isCompleted) release.complete();
@@ -6112,9 +6141,13 @@ void main() async {
       bool? openedAtDestructiveClose;
       DbasSqlite.debugBeforeDestructiveClose = (d) {
         opsAtDestructiveClose = d.debugInFlightNativeOpCount;
-        // The handles are nulled before the destructive dispatch is
+        // The WRITER handle is nulled before the destructive dispatch is
         // awaited, so a main-isolate racer sees a CLOSED connection
-        // rather than one whose pointer is mid-free.
+        // rather than one whose pointer is mid-free. (The POOL pointer is
+        // deliberately the other way round — it stays readable until
+        // closePool returns, because a reader release arriving in that
+        // window is exactly what the call is blocked waiting for. The
+        // joins-an-in-progress-close test pins that half.)
         openedAtDestructiveClose = d.isOpened();
       };
 
@@ -6160,10 +6193,9 @@ void main() async {
           reason: 'closePool ran while an operation was still registered '
               'as inside native code');
       expect(openedAtDestructiveClose, isFalse,
-          reason: 'the writer / pool handles must be nulled BEFORE the '
-              'destructive dispatch is awaited, so a concurrent '
-              'isOpened() on the main isolate cannot hand a '
-              'being-freed pointer back into FFI');
+          reason: 'the writer handle must be nulled BEFORE the destructive '
+              'dispatch is awaited, so a concurrent isOpened() on the main '
+              'isolate cannot hand a being-freed pointer back into FFI');
       expect(reader.isClosed, isTrue,
           reason: 'the reader the parked read produced must have been '
               'closed by the sweep — that close is what returns its pool '
@@ -6440,6 +6472,8 @@ void main() async {
       expect(closeCompleted, isTrue,
           reason: 'closeDb neither settled while the step was parked nor '
               'within 5s of the step being released');
+      expect(closeOutcome, isNull,
+          reason: 'closeDb must complete, not merely settle');
     } finally {
       DbasSqliteReader.debugInsideReadRowStep = null;
       // Unpark the step on the failing path too, so a thrown expect
@@ -6522,6 +6556,179 @@ void main() async {
     }
   });
 
+  test(
+      'reader: readerClosedDuringScan names the close it observed instead of '
+      'asserting a teardown', () async {
+    // The message is a diagnosis, and a diagnosis that guesses sends the
+    // reader of it somewhere else. A reader records THAT it was closed,
+    // not by whom — so the text used to list every possibility and then
+    // assert the worst one ("something tore it down mid-scan"). A
+    // consumer who closes deliberately after a partial scan and probes
+    // the reader again was told their database had been torn down during
+    // shutdown, and went looking for a closeDb() that never happened.
+    //
+    // All three branches in one test, so the contrast is the assertion
+    // rather than a claim — each arm asserts the text it must carry AND
+    // the text it must not.
+    final db = await _createTestDb('reader_closed_reason_message.db');
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      for (int i = 1; i <= 3; i++) {
+        await _runSql(db, 'INSERT INTO t VALUES ($i)');
+      }
+
+      // Deliberate close by the consumer.
+      final ownStmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final ownReader = await ownStmt.executeReader();
+      expect(await ownReader.readRow(), isTrue);
+      await ownStmt.close();
+      await expectLater(
+        ownReader.readRow(),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.readerClosedDuringScan)
+            .having((e) => e.message, 'message', contains('explicit close()'))
+            .having((e) => e.message, 'message', isNot(contains('closeDb')))),
+        reason: 'a reader the consumer closed themselves must not be '
+            'reported as torn down by a database shutdown — that sends '
+            'them hunting for a closeDb() that never ran',
+      );
+
+      // Closed by its own failed step. `readRow` closes the reader itself
+      // as part of reporting a step failure, so the state a later call
+      // finds was created by the caller's own already-thrown exception —
+      // reporting it as either an explicit close or a teardown sends the
+      // reader of the message looking for a close that never happened.
+      //
+      // `abs(-9223372036854775808)` is the reachable way in: SQLite
+      // prepares it happily and raises "integer overflow" at STEP, which
+      // is the only route to this arm — the branch is untested rather
+      // than unreachable, and before this it had never been rendered at
+      // all.
+      final failStmt = await db.prepareQuery('SELECT abs(-9223372036854775808)');
+      final failReader = await failStmt.executeReader();
+      await expectLater(
+        failReader.readRow(),
+        throwsA(isA<DbasSqliteException>().having(
+            (e) => e.code, 'code', DbasSqliteErrorCode.readRowFailed)),
+        reason: 'the step must fail at step time — a query that fails at '
+            'prepare would never reach the arm this asserts',
+      );
+      expect(failReader.isClosed, isTrue,
+          reason: 'readRow closes the reader as part of reporting a step '
+              'failure; without that close there is no later state to '
+              'describe');
+      await expectLater(
+        failReader.readRow(),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.readerClosedDuringScan)
+            .having((e) => e.message, 'message',
+                contains('An earlier readRow() failed'))
+            .having((e) => e.message, 'message', contains('readRowFailed'))
+            .having((e) => e.message, 'message', isNot(contains('closeDb')))
+            .having((e) => e.message, 'message',
+                isNot(contains('explicit close()')))),
+        reason: 'a reader its own failed step closed must point at that '
+            'failure, not at a close() or a closeDb() that never ran',
+      );
+      await failStmt.close();
+
+      // Torn down by teardown, which is the one caller allowed to say so.
+      final sweptStmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final sweptReader = await sweptStmt.executeReader();
+      expect(await sweptReader.readRow(), isTrue);
+      await db.closeDb();
+      expect(sweptReader.isClosed, isTrue);
+      await expectLater(
+        sweptReader.readRow(),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.readerClosedDuringScan)
+            .having((e) => e.message, 'message',
+                contains("closeDb()'s statement sweep"))),
+        reason: 'the one case that really is a teardown must still say so, '
+            'or the branch buys nothing',
+      );
+    } finally {
+      // closeDb is idempotent-ish here: the teardown branch above may
+      // already have closed it, and re-closing a closed database is a
+      // no-op, so this stays correct on the failing path too.
+      await db.closeDb();
+      await db.dropDb();
+    }
+  });
+
+  test(
+      'executeScalar propagates readerClosedDuringScan instead of the null it '
+      'used to report', () async {
+    // The headline consumer-visible change, and the one place the throw
+    // replaces a `null`. `executeScalar` runs exactly one readRow, so a
+    // reader torn down between `executeReader` returning and that call
+    // used to make the method answer `null` — indistinguishable from a
+    // genuinely empty query, and silently wrong for a caller that treats
+    // null as "no such row".
+    //
+    // Reached through `debugBeforeScalarReadRow`, which is the only way
+    // in: the window is microtasks wide — every step from the reader's
+    // construction to the readRow dispatch is pure Dart — so another
+    // async flow is always scheduled either wholly before it or wholly
+    // after it. Measured: a flow polling for the reader to appear and
+    // closing the instant it does still lands after the readRow has been
+    // dispatched. The seam runs the close INSIDE the window instead, at
+    // exactly the instruction the contract talks about.
+    //
+    // `stmt.close()` is the "close on this statement from elsewhere" that
+    // contract names, and it is awaited in full here — no step is in
+    // flight yet (readRow has not run), so the reader's step drain is
+    // empty and the close cannot deadlock against the scan it precedes.
+    final db = await _createTestDb('scalar_closed_during_scan.db');
+    addTearDown(() => DbasSqliteStatement.debugBeforeScalarReadRow = null);
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+      await _runSql(db, "INSERT INTO t VALUES (1, 'first')");
+
+      final stmt = await db.prepareQuery('SELECT val FROM t WHERE id = 1');
+      var closedInsideWindow = false;
+      DbasSqliteStatement.debugBeforeScalarReadRow = () async {
+        DbasSqliteStatement.debugBeforeScalarReadRow = null;
+        await stmt.close();
+        closedInsideWindow = true;
+      };
+
+      await expectLater(
+        stmt.executeScalar(),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.readerClosedDuringScan)
+            .having((e) => e.category, 'category',
+                DbasSqliteErrorCategory.busyOrCancelled)),
+        reason: 'executeScalar swallowed the truncation and reported the '
+            'same null an empty result set reports — a caller treating '
+            'null as "no such row" is then silently wrong, which is '
+            'exactly what this release changed',
+      );
+      expect(closedInsideWindow, isTrue,
+          reason: 'the close never ran, so this run proves nothing about '
+              'the window');
+      expect(stmt.isClosed, isTrue,
+          reason: 'the throw must not skip executeScalar\'s own cleanup');
+
+      // The contrast: a genuinely empty result still answers null, so the
+      // throw above is about truncation and not about scalars in general.
+      final empty = await (await db
+              .prepareQuery('SELECT val FROM t WHERE id = 99'))
+          .executeScalar();
+      expect(empty, isNull,
+          reason: 'null must still mean "no row" — the throw replaces it '
+              'only where the scan was cut short');
+    } finally {
+      DbasSqliteStatement.debugBeforeScalarReadRow = null;
+      await db.closeDb();
+      await db.dropDb();
+    }
+  });
+
   test('reader: readRows propagates the truncation instead of swallowing it',
       () async {
     // readRows is the library's own readRow loop, so it inherits the
@@ -6571,40 +6778,46 @@ void main() async {
     // teardown. This is the accepted trade, so it is asserted rather than
     // left to be discovered downstream.
     final db = await _createTestDb('reader_close_db_mid_scan.db');
-    await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
-    for (int i = 1; i <= 4; i++) {
-      await _runSql(db, 'INSERT INTO t VALUES ($i)');
-    }
-
-    final reader = await (await db.prepareQuery('SELECT id FROM t ORDER BY id'))
-        .executeReader();
-    final collected = <int>[];
-    expect(await reader.readRow(), isTrue);
-    collected.add(reader.getColumnInt(0));
-
-    // No step is outstanding at this instant, so closeDb has nothing to
-    // wait for and tears the reader down through its statement sweep.
-    await db.closeDb();
-    expect(reader.isClosed, isTrue);
-
-    Object? loopOutcome;
     try {
-      while (await reader.readRow()) {
-        collected.add(reader.getColumnInt(0));
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      for (int i = 1; i <= 4; i++) {
+        await _runSql(db, 'INSERT INTO t VALUES ($i)');
       }
-    } catch (e) {
-      loopOutcome = e;
+
+      final reader =
+          await (await db.prepareQuery('SELECT id FROM t ORDER BY id'))
+              .executeReader();
+      final collected = <int>[];
+      expect(await reader.readRow(), isTrue);
+      collected.add(reader.getColumnInt(0));
+
+      // No step is outstanding at this instant, so closeDb has nothing to
+      // wait for and tears the reader down through its statement sweep.
+      await db.closeDb();
+      expect(reader.isClosed, isTrue);
+
+      Object? loopOutcome;
+      try {
+        while (await reader.readRow()) {
+          collected.add(reader.getColumnInt(0));
+        }
+      } catch (e) {
+        loopOutcome = e;
+      }
+
+      expect(collected, [1], reason: 'only row 1 was ever read');
+      expect(
+          loopOutcome,
+          isA<DbasSqliteException>().having((e) => e.code, 'code',
+              DbasSqliteErrorCode.readerClosedDuringScan),
+          reason: 'the loop must end in an error event; ending normally '
+              'would hand the caller [1] as if the table held one row');
+    } finally {
+      // In a `finally` so a failing expect above cannot skip the drop and
+      // leave a .db behind. The database is already closed on the happy
+      // path; dropDb does not need it open.
+      await db.dropDb();
     }
-
-    expect(collected, [1], reason: 'only row 1 was ever read');
-    expect(
-        loopOutcome,
-        isA<DbasSqliteException>().having((e) => e.code, 'code',
-            DbasSqliteErrorCode.readerClosedDuringScan),
-        reason: 'the loop must end in an error event; ending normally '
-            'would hand the caller [1] as if the table held one row');
-
-    await db.dropDb();
   });
 
   test(
@@ -6734,12 +6947,14 @@ void main() async {
       // leave a step suspended into the next test.
       if (!releaseA.isCompleted) releaseA.complete();
       if (!releaseB.isCompleted) releaseB.complete();
-      // Same rule as the case above: touch the database again only once
-      // teardown actually finished.
-      if (closeReturned) {
-        await db.closeDb();
-        await db.dropDb();
-      }
+      // `closeReturned` tracks the STATEMENT close, not `closeDb`, so it
+      // must not gate the database close: an early `expect` failure would
+      // otherwise leave this database open and parked in
+      // `DbasSqlite._instance` for the rest of the run. Both steps are
+      // unparked above, so nothing here can wedge. Only the file deletion
+      // waits on the flag.
+      await db.closeDb();
+      if (closeReturned) await db.dropDb();
     }
   });
 
@@ -6823,10 +7038,1072 @@ void main() async {
       DbasSqliteReader.debugInsideReadRowStep = null;
       DbasSqliteReader.debugStepDrainStallReportMs = null;
       if (!release.isCompleted) release.complete();
-      if (closeReturned) {
-        await db.closeDb();
-        await db.dropDb();
+      // `closeReturned` tracks the STATEMENT close, so gating the
+      // DATABASE close on it would strand this database open in
+      // `DbasSqlite._instance` after an early failure. The step is
+      // unparked above, so nothing here can wedge.
+      await db.closeDb();
+      if (closeReturned) await db.dropDb();
+    }
+  });
+
+  test(
+      'reader: the stall report reaches a consumer sink, not only '
+      'dart:developer', () async {
+    // The stall report is the entire justification for leaving the step
+    // wait unbounded — "a wedged teardown can be diagnosed from a log
+    // instead of inferred from a hang". `developer.log` cannot deliver
+    // that: it publishes to the VM service `Logging` stream and the
+    // message is dropped whenever no service client is subscribed, which
+    // is every release build on a device and every `flutter test` run.
+    // So the counter below proves the timer fires, and this proves the
+    // message actually reaches somebody who can write it down.
+    final db = await _createTestDb('reader_stall_report_sink.db');
+    addTearDown(() {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+      DbasSqlite.onDiagnostic = null;
+    });
+    final release = Completer<void>();
+    var closeReturned = false;
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await _runSql(db, 'INSERT INTO t VALUES (1)');
+      await _runSql(db, 'INSERT INTO t VALUES (2)');
+
+      final reported = <String>[];
+      DbasSqlite.onDiagnostic = reported.add;
+      DbasSqliteReader.debugStepDrainStallReportMs = 20;
+
+      final reached = Completer<void>();
+      DbasSqliteReader.debugInsideReadRowStep = () async {
+        DbasSqliteReader.debugInsideReadRowStep = null;
+        reached.complete();
+        await release.future;
+      };
+
+      final stmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final reader = await stmt.executeReader();
+      final row =
+          reader.readRow().then<Object?>((r) => r, onError: (Object e) => e);
+      await reached.future;
+      final cached = Stopwatch()..start();
+      while (reader.getColumnText(0) != '1' &&
+          cached.elapsedMilliseconds < 2000) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
       }
+      expect(reader.getColumnText(0), '1');
+      expect(reported, isEmpty,
+          reason: 'nothing has waited for a step yet');
+
+      final close = stmt.close().whenComplete(() => closeReturned = true);
+      final stalled = Stopwatch()..start();
+      while (reported.length < 2 && stalled.elapsedMilliseconds < 3000) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+
+      expect(reported.length, greaterThanOrEqualTo(2),
+          reason: 'the stall report never reached the sink. A consumer '
+              'that wired onDiagnostic still has no way to see a wedged '
+              'teardown, which is the only diagnosis an unbounded wait '
+              'ever produces');
+      // The message has to carry what is stuck, not just that something
+      // is: a report a consumer cannot act on is no better than silence.
+      expect(reported.first, contains('in-flight readRow step'));
+      expect(reported.first, contains('UNBOUNDED'));
+
+      release.complete();
+      expect(await row, isTrue,
+          reason: 'the parked step must still deliver its row; a run in '
+              'which it failed would prove nothing about the teardown '
+              'window this test is about');
+      await close.timeout(const Duration(seconds: 5));
+      expect(closeReturned, isTrue);
+    } finally {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+      DbasSqlite.onDiagnostic = null;
+      if (!release.isCompleted) release.complete();
+      // `closeReturned` tracks the STATEMENT close, not `closeDb`, so it
+      // must not gate the database close: an early `expect` failure would
+      // otherwise leave this database open and parked in
+      // `DbasSqlite._instance` for the rest of the run. The step is
+      // already unparked above, so nothing here can wedge. Only the file
+      // deletion waits on the flag.
+      await db.closeDb();
+      if (closeReturned) await db.dropDb();
+    }
+  });
+
+  test('reader: a diagnostic sink that throws cannot break teardown',
+      () async {
+    // The sink is consumer code called from inside a close. If its
+    // exception escaped, wiring a logger would turn a slow teardown into
+    // a failed one — and the wait it reports on is the one that must not
+    // be interrupted, because expiring it means finalizing a statement a
+    // step is still using.
+    final db = await _createTestDb('reader_stall_report_sink_throws.db');
+    addTearDown(() {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+      DbasSqlite.onDiagnostic = null;
+    });
+    final release = Completer<void>();
+    var closeReturned = false;
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await _runSql(db, 'INSERT INTO t VALUES (1)');
+      await _runSql(db, 'INSERT INTO t VALUES (2)');
+
+      var sinkCalls = 0;
+      DbasSqlite.onDiagnostic = (_) {
+        sinkCalls++;
+        throw StateError('consumer logger blew up');
+      };
+      DbasSqliteReader.debugStepDrainStallReportMs = 20;
+
+      final reached = Completer<void>();
+      DbasSqliteReader.debugInsideReadRowStep = () async {
+        DbasSqliteReader.debugInsideReadRowStep = null;
+        reached.complete();
+        await release.future;
+      };
+
+      final stmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final reader = await stmt.executeReader();
+      final row =
+          reader.readRow().then<Object?>((r) => r, onError: (Object e) => e);
+      await reached.future;
+      final cached = Stopwatch()..start();
+      while (reader.getColumnText(0) != '1' &&
+          cached.elapsedMilliseconds < 2000) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      expect(reader.getColumnText(0), '1');
+
+      Object? closeOutcome;
+      final close = stmt.close().then<Object?>(
+        (_) => null,
+        onError: (Object e) => closeOutcome = e,
+      ).whenComplete(() => closeReturned = true);
+
+      final stalled = Stopwatch()..start();
+      while (sinkCalls < 2 && stalled.elapsedMilliseconds < 3000) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(sinkCalls, greaterThanOrEqualTo(2),
+          reason: 'the first throw must not stop the reporting either — a '
+              'wait that reported once and then went quiet says nothing '
+              'about a teardown still wedged minutes later');
+
+      release.complete();
+      expect(await row, isTrue,
+          reason: 'the parked step must still deliver its row; a run in '
+              'which it failed would prove nothing about the teardown '
+              'window this test is about');
+      await close.timeout(const Duration(seconds: 5));
+      expect(closeReturned, isTrue);
+      expect(closeOutcome, isNull,
+          reason: "a consumer logger's exception must not surface as a "
+              'failed close');
+      expect(reader.isClosed, isTrue);
+    } finally {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+      DbasSqlite.onDiagnostic = null;
+      if (!release.isCompleted) release.complete();
+      // See the sibling sink test: `closeReturned` tracks the STATEMENT
+      // close, so gating the DATABASE close on it would strand this
+      // database open in `DbasSqlite._instance` after an early failure.
+      await db.closeDb();
+      if (closeReturned) await db.dropDb();
+    }
+  });
+
+  test(
+      'reader: a diagnostic sink that throws still gets the message out '
+      'through a sink that survives release', () async {
+    // "Cannot break a close" is only half the contract. The other half is
+    // that the escape hatch survives its own failure: when the consumer
+    // sink throws, falling back to `developer.log` alone falls back to
+    // exactly the sink `onDiagnostic` exists to replace — dropped
+    // whenever no VM service client is subscribed, which is every release
+    // build on a device and every `flutter test` run.
+    //
+    // The shape that makes it matter is ordinary: a consumer whose logger
+    // is torn down BEFORE the database. Shutdown is precisely when a
+    // stall report fires, so that consumer would get complete silence
+    // about a wedged teardown. `Zone.current.print` reaches logcat /
+    // oslog in a release build and this runner's stdout under
+    // `flutter test`, so the ORIGINAL message goes out through it too —
+    // not merely a note that the sink failed.
+    //
+    // The zone is what makes that observable: overriding `print` captures
+    // exactly what a release build would have written.
+    final printed = <String>[];
+    await runZoned(
+      () async {
+        final db = await _createTestDb('reader_stall_report_sink_fallback.db');
+        addTearDown(() {
+          DbasSqliteReader.debugInsideReadRowStep = null;
+          DbasSqliteReader.debugStepDrainStallReportMs = null;
+          DbasSqlite.onDiagnostic = null;
+        });
+        final release = Completer<void>();
+        var closeReturned = false;
+        try {
+          await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+          await _runSql(db, 'INSERT INTO t VALUES (1)');
+          await _runSql(db, 'INSERT INTO t VALUES (2)');
+
+          // The logger that is already gone by the time teardown reports.
+          DbasSqlite.onDiagnostic = (_) {
+            throw StateError('consumer logger already torn down');
+          };
+          DbasSqliteReader.debugStepDrainStallReportMs = 20;
+
+          final reached = Completer<void>();
+          DbasSqliteReader.debugInsideReadRowStep = () async {
+            DbasSqliteReader.debugInsideReadRowStep = null;
+            reached.complete();
+            await release.future;
+          };
+
+          final stmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+          final reader = await stmt.executeReader();
+          final row = reader
+              .readRow()
+              .then<Object?>((r) => r, onError: (Object e) => e);
+          await reached.future;
+          final cached = Stopwatch()..start();
+          while (reader.getColumnText(0) != '1' &&
+              cached.elapsedMilliseconds < 2000) {
+            await Future<void>.delayed(const Duration(milliseconds: 1));
+          }
+          expect(reader.getColumnText(0), '1');
+          expect(printed, isEmpty,
+              reason: 'nothing has waited for a step yet');
+
+          Object? closeOutcome;
+          final close = stmt.close().then<Object?>(
+            (_) => null,
+            onError: (Object e) => closeOutcome = e,
+          ).whenComplete(() => closeReturned = true);
+
+          final stalled = Stopwatch()..start();
+          while (printed.isEmpty && stalled.elapsedMilliseconds < 3000) {
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+          }
+
+          expect(printed, isNotEmpty,
+              reason: 'the sink threw and the report went nowhere a '
+                  'release build can read. developer.log is the sink this '
+                  'mechanism exists to replace, so falling back to it '
+                  'alone means a wedged teardown reports NOTHING to a '
+                  'consumer whose logger died first');
+          // The original diagnostic, not just a note that the sink blew
+          // up: a report a consumer cannot act on is no better than
+          // silence.
+          expect(printed.first, contains('in-flight readRow step'));
+          expect(printed.first, contains('UNBOUNDED'));
+          expect(printed.first, contains('consumer logger already torn down'),
+              reason: 'the fallback must also say WHY it is the one '
+                  'reporting, or the sink failure itself stays invisible');
+
+          release.complete();
+          expect(await row, isTrue,
+              reason: 'the parked step must still deliver its row; a run in '
+                  'which it failed would prove nothing about the teardown '
+                  'window this test is about');
+          await close.timeout(const Duration(seconds: 5));
+          expect(closeReturned, isTrue);
+          expect(closeOutcome, isNull,
+              reason: "a consumer logger's exception must not surface as a "
+                  'failed close');
+        } finally {
+          DbasSqliteReader.debugInsideReadRowStep = null;
+          DbasSqliteReader.debugStepDrainStallReportMs = null;
+          DbasSqlite.onDiagnostic = null;
+          if (!release.isCompleted) release.complete();
+          await db.closeDb();
+          if (closeReturned) await db.dropDb();
+        }
+      },
+      zoneSpecification: ZoneSpecification(
+        print: (self, parent, zone, line) => printed.add(line),
+      ),
+    );
+  });
+
+  test(
+      'reader: the step a hook observes is already published to the drain',
+      () async {
+    // `_stepAndCache` claims there is no path on which a step reaches
+    // native code without reaching `_inFlightSteps`. The hook path used
+    // to break it: an `async` body runs synchronously to its first
+    // `await`, so the hook fired BEFORE the composed future was
+    // published, and anything the hook started that consulted the set
+    // saw an empty one — a close started there would have finalized the
+    // statement under a live step.
+    //
+    // Observed rather than provoked: the destructive version of this
+    // check is the corruption itself, and a SIGSEGV kills the runner
+    // instead of failing an assertion.
+    final db = await _createTestDb('reader_step_published_before_hook.db');
+    addTearDown(() => DbasSqliteReader.debugInsideReadRowStep = null);
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await _runSql(db, 'INSERT INTO t VALUES (1)');
+
+      DbasSqliteReader? target;
+      int? stepsVisibleInsideHook;
+      DbasSqliteReader.debugInsideReadRowStep = () async {
+        DbasSqliteReader.debugInsideReadRowStep = null;
+        stepsVisibleInsideHook = target!.debugInFlightStepCount;
+      };
+
+      final stmt = await db.prepareQuery('SELECT id FROM t');
+      final reader = await stmt.executeReader();
+      target = reader;
+      expect(reader.debugInFlightStepCount, 0,
+          reason: 'nothing is dispatched before the first readRow');
+      expect(await reader.readRow(), isTrue);
+
+      expect(stepsVisibleInsideHook, 1,
+          reason: 'the hook ran while its own step was invisible to the '
+              'drain. Anything it started that reads _inFlightSteps — a '
+              'close, above all — would have concluded that no step was '
+              'outstanding and finalized the statement under a live one');
+      expect(reader.debugInFlightStepCount, 0,
+          reason: 'readRow clears its own registration once the step '
+              'settles');
+      await stmt.close();
+    } finally {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      await db.closeDb();
+      await db.dropDb();
+    }
+  });
+
+  test(
+      'pool: setBusyTimeout is rejected once teardown has started, not '
+      'registered behind the drain', () async {
+    // `_drainNativeOps` runs ONCE. Most registry callers are saved by a
+    // second gate — `_acquireWriterLock` and `_acquireReaderSlot` both
+    // reject while closing — but setBusyTimeout has neither: it checks
+    // readers out of the C pool DIRECTLY, bypassing the Dart-side
+    // semaphore, and its only other guard is `_db == null`, which is
+    // still false at every one of closeDb's post-drain suspension
+    // points. Arriving there it would register into a registry nobody
+    // drains again and hold readers ClosePool is waiting for.
+    //
+    // The suspension point used here is the statement sweep, parked on a
+    // reader's step drain — proven parked by the stall report rather
+    // than assumed by a sleep.
+    final db = await _createTestDb('pool_set_busy_timeout_while_closing.db',
+        readerPoolSize: 2);
+    addTearDown(() {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+      DbasSqlite.debugSetBusyTimeoutAcquireMs = null;
+    });
+    final release = Completer<void>();
+    var closeReturned = false;
+    Object? closeOutcome;
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await _runSql(db, 'INSERT INTO t VALUES (1)');
+      await _runSql(db, 'INSERT INTO t VALUES (2)');
+
+      // Bounded, so a regression that lets the call through fails on the
+      // error code in a few hundred ms instead of pausing for 5 s.
+      DbasSqlite.debugSetBusyTimeoutAcquireMs = 200;
+      DbasSqliteReader.debugStepDrainStallReportMs = 20;
+
+      final reached = Completer<void>();
+      DbasSqliteReader.debugInsideReadRowStep = () async {
+        DbasSqliteReader.debugInsideReadRowStep = null;
+        reached.complete();
+        await release.future;
+      };
+
+      final stmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final reader = await stmt.executeReader();
+      final row =
+          reader.readRow().then<Object?>((r) => r, onError: (Object e) => e);
+      await reached.future;
+      final cached = Stopwatch()..start();
+      while (reader.getColumnText(0) != '1' &&
+          cached.elapsedMilliseconds < 2000) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      expect(reader.getColumnText(0), '1');
+
+      // The error handler is attached HERE, at construction, not at the
+      // `await` thirty-odd lines below: a rejection in between would
+      // otherwise surface as an unhandled asynchronous error attributed
+      // to whatever test happens to be running.
+      final close = db.closeDb().then<Object?>(
+        (_) => null,
+        onError: (Object e) => closeOutcome = e,
+      ).whenComplete(() => closeReturned = true);
+
+      // A positive witness that closeDb is parked in the SWEEP — i.e.
+      // past `_drainNativeOps`, which is the whole precondition. The
+      // stall report only ever fires from inside the reader's step
+      // drain, and the sweep is the only caller that reaches it here.
+      final stalled = Stopwatch()..start();
+      while (reader.debugStepDrainStallReports < 1 &&
+          stalled.elapsedMilliseconds < 3000) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(reader.debugStepDrainStallReports, greaterThanOrEqualTo(1),
+          reason: 'closeDb never reached the statement sweep, so this run '
+              'never got to the window it is about');
+      expect(db.isOpened(), isTrue,
+          reason: 'the pre-existing `_db == null` guard is still open here '
+              '— which is exactly why it cannot be the one that rejects '
+              'this call');
+
+      await expectLater(
+        db.setBusyTimeout(4000),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.readerSlotWaitCancelled)
+            .having((e) => e.category, 'category',
+                DbasSqliteErrorCategory.busyOrCancelled)),
+        reason: 'setBusyTimeout registered and reached the C pool after '
+            'the drain had already run',
+      );
+      expect(db.debugInFlightNativeOpCount, 0,
+          reason: 'a rejected call must not leave a registration behind: '
+              'nothing will ever drain this registry again');
+
+      release.complete();
+      expect(await row, isTrue,
+          reason: 'the parked step must still deliver its row; a run in '
+              'which it failed would prove nothing about the teardown '
+              'window this test is about');
+      await close.timeout(const Duration(seconds: 10));
+      expect(closeReturned, isTrue);
+      expect(closeOutcome, isNull,
+          reason: 'the rejected setBusyTimeout must leave teardown itself '
+              'intact — closeDb must complete, not merely settle');
+    } finally {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+      DbasSqlite.debugSetBusyTimeoutAcquireMs = null;
+      if (!release.isCompleted) release.complete();
+      if (closeReturned) await db.dropDb();
+    }
+  });
+
+  test(
+      'pool: enableWal is rejected once teardown has started, not registered '
+      'behind the drain', () async {
+    // The sibling hole, and the last registry caller without a second
+    // gate. `checkpoint`, `vacuum`, `beginTransaction`, `commit` and
+    // `executeScript` all take `_acquireWriterLock` first, which rejects
+    // while closing; `executeReader` registers early but is rejected
+    // immediately by the slot/lock gate and clears itself in a `finally`;
+    // `setBusyTimeout` carries an explicit guard. `enableWal` had
+    // neither — its only other guard is `_db == null`, still false at
+    // every one of closeDb's post-drain suspension points.
+    //
+    // Reaching it there is not theoretical: it dispatches the
+    // journal-mode switch AND both writer pragmas — several worker
+    // round-trips on `_db` — while closeDb is on its way to `closePool`,
+    // which force-closes that same writer via `closeDbCore(force=true)`.
+    //
+    // The suspension point used here is the statement sweep, parked on a
+    // reader's step drain — proven parked by the stall report rather
+    // than assumed by a sleep. Same harness shape as the setBusyTimeout
+    // case above, deliberately.
+    final db = await _createTestDb('pool_enable_wal_while_closing.db',
+        readerPoolSize: 2);
+    addTearDown(() {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+    });
+    final release = Completer<void>();
+    var closeReturned = false;
+    Object? closeOutcome;
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await _runSql(db, 'INSERT INTO t VALUES (1)');
+      await _runSql(db, 'INSERT INTO t VALUES (2)');
+
+      DbasSqliteReader.debugStepDrainStallReportMs = 20;
+
+      final reached = Completer<void>();
+      DbasSqliteReader.debugInsideReadRowStep = () async {
+        DbasSqliteReader.debugInsideReadRowStep = null;
+        reached.complete();
+        await release.future;
+      };
+
+      final stmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final reader = await stmt.executeReader();
+      final row =
+          reader.readRow().then<Object?>((r) => r, onError: (Object e) => e);
+      await reached.future;
+      final cached = Stopwatch()..start();
+      while (reader.getColumnText(0) != '1' &&
+          cached.elapsedMilliseconds < 2000) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      expect(reader.getColumnText(0), '1');
+
+      final close = db.closeDb().then<Object?>(
+        (_) => null,
+        onError: (Object e) => closeOutcome = e,
+      ).whenComplete(() => closeReturned = true);
+
+      // A positive witness that closeDb is parked in the SWEEP — i.e.
+      // past `_drainNativeOps`, which is the whole precondition. The
+      // stall report only ever fires from inside the reader's step
+      // drain, and the sweep is the only caller that reaches it here.
+      final stalled = Stopwatch()..start();
+      while (reader.debugStepDrainStallReports < 1 &&
+          stalled.elapsedMilliseconds < 3000) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(reader.debugStepDrainStallReports, greaterThanOrEqualTo(1),
+          reason: 'closeDb never reached the statement sweep, so this run '
+              'never got to the window it is about');
+      expect(db.isOpened(), isTrue,
+          reason: 'the pre-existing `_db == null` guard is still open here '
+              '— which is exactly why it cannot be the one that rejects '
+              'this call');
+      expect(db.isInTransaction, isFalse,
+          reason: 'the enableWalInsideTransaction guard must not be the one '
+              'rejecting this call either');
+
+      await expectLater(
+        db.enableWal(),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.writerLockWaitCancelled)
+            .having((e) => e.category, 'category',
+                DbasSqliteErrorCategory.busyOrCancelled)),
+        reason: 'enableWal registered and dispatched onto the writer after '
+            'the drain had already run — against the very connection '
+            'closePool is about to force-close',
+      );
+      expect(db.debugInFlightNativeOpCount, 0,
+          reason: 'a rejected call must not leave a registration behind: '
+              'nothing will ever drain this registry again');
+
+      release.complete();
+      expect(await row, isTrue,
+          reason: 'the parked step must still deliver its row; a run in '
+              'which it failed would prove nothing about the teardown '
+              'window this test is about');
+      await close.timeout(const Duration(seconds: 10));
+      expect(closeReturned, isTrue);
+      expect(closeOutcome, isNull,
+          reason: 'the rejected enableWal must leave teardown itself intact '
+              '— closeDb must complete, not merely settle');
+    } finally {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqliteReader.debugStepDrainStallReportMs = null;
+      if (!release.isCompleted) release.complete();
+      if (closeReturned) await db.dropDb();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Regression: closeDb must JOIN a close that is already in progress —
+  // skipping one is a permanent hang.
+  //
+  // `DbasSqliteReader.close()` latches `_closed` SYNCHRONOUSLY and then
+  // suspends, at two points: the in-flight step drain and `onClose`
+  // (whose `finalizeStmt` is a real worker dispatch). For that whole
+  // stretch the reader reports `isClosed == true` while still holding a
+  // checked-out pool reader and a live `sqlite3_stmt` — and the statement
+  // sweep used to read that flag as "nothing left to do":
+  // `DbasSqliteStatement.close()` skipped a reader that was already
+  // `isClosed`, and returned immediately once its own `_closed` was set.
+  // `_activeStatements.clear()` then disowned the statement outright.
+  //
+  // Nothing after that releases the pool reader, so `ClosePool` — which
+  // blocks until every checked-out reader is back — waits forever and
+  // `closeDb()` never returns. There is no timeout on that path: the
+  // native-op drain has already run, and the reader's own step drain is
+  // unbounded by design. The live shape is `unawaited(reader.close())`
+  // followed by `closeDb()` — logout while a list view is mid-scan.
+  //
+  // Two doors into the same window, one test each: the reader's own
+  // `close()`, and the statement's.
+  //
+  // Both bound every wait so a regression FAILS instead of wedging the
+  // suite, and neither ever steps or closes a reader on a path where the
+  // pool may already be gone.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test(
+      'pool: closeDb joins a reader close that is already in progress '
+      'instead of skipping it', () async {
+    final db = await _createTestDb('pool_close_joins_inflight_reader.db',
+        readerPoolSize: 2);
+    addTearDown(() {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqlite.debugBeforeDestructiveClose = null;
+    });
+    final release = Completer<void>();
+    var closeReturned = false;
+    Object? closeOutcome;
+    // Hoisted out of the `try` so the `finally` can read them: whether
+    // unparking the step is still safe depends on how far teardown got.
+    var destructiveCloseReached = false;
+    bool? readerCloseSettledAtDestructiveClose;
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      for (int i = 1; i <= 3; i++) {
+        await _runSql(db, 'INSERT INTO t VALUES ($i)');
+      }
+
+      var readerCloseSettled = false;
+      int? releasablePoolPtrAtDestructiveClose;
+      DbasSqlite.debugBeforeDestructiveClose = (d) {
+        destructiveCloseReached = true;
+        readerCloseSettledAtDestructiveClose = readerCloseSettled;
+        releasablePoolPtrAtDestructiveClose = d.debugReleasablePoolPtr;
+      };
+
+      // A rendezvous, not a sleep: `reached` proves the step is parked at
+      // the offending instruction rather than merely likely to be.
+      // One-shot — closeDb runs a WAL checkpoint of its own on the way
+      // out, and that must not park too.
+      final reached = Completer<void>();
+      DbasSqliteReader.debugInsideReadRowStep = () async {
+        DbasSqliteReader.debugInsideReadRowStep = null;
+        reached.complete();
+        await release.future;
+      };
+
+      final stmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final reader = await stmt.executeReader();
+      final row =
+          reader.readRow().then<Object?>((r) => r, onError: (Object e) => e);
+      await reached.future;
+
+      // Land the dispatched step's reply before anything is torn down,
+      // for the same reason as the cases above: what the close then waits
+      // on is the reader's own bookkeeping, not a live sqlite3_step, so a
+      // regression fails an `expect` instead of dying on a signal.
+      final cached = Stopwatch()..start();
+      while (reader.getColumnText(0) != '1' &&
+          cached.elapsedMilliseconds < 2000) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      expect(reader.getColumnText(0), '1',
+          reason: 'the parked step never delivered its row, so this run '
+              'would prove nothing about what closeDb joins');
+
+      // The production shape: a close nobody awaited. It latches
+      // `_closed` synchronously and then parks on the step drain.
+      //
+      // `whenComplete` is chained straight onto `close()`'s own future,
+      // which makes it listener NUMBER ONE on it — the sweep only
+      // registers its `await` later, when closeDb reaches it. So
+      // `readerCloseSettled` is guaranteed to be true before the sweep
+      // resumes, and the ordering recorded at the destructive dispatch is
+      // a fact rather than a microtask race.
+      Object? readerCloseOutcome;
+      final readerClose = reader
+          .close()
+          .whenComplete(() => readerCloseSettled = true)
+          .then<Object?>(
+              (_) => null, onError: (Object e) => readerCloseOutcome = e);
+      expect(reader.isClosed, isTrue,
+          reason: 'close() must latch isClosed synchronously — that flag '
+              'being true while the reader still owns its pool connection '
+              'is the whole hazard');
+
+      // The live pool pointer, read before teardown starts, so the
+      // retention assertion below can say WHICH pointer survived rather
+      // than merely that something did.
+      final livePoolPtr = db.debugReleasablePoolPtr;
+      expect(livePoolPtr, isNotNull,
+          reason: 'an open pooled database must have a pool pointer, or '
+              'the retention assertion below proves nothing');
+
+      final close = db.closeDb().then<Object?>(
+        (_) => null,
+        onError: (Object e) => closeOutcome = e,
+      ).whenComplete(() => closeReturned = true);
+
+      // Pumped with real event-loop turns, not microtask drains: every
+      // closeDb step is a worker-isolate round-trip whose reply a
+      // microtask drain would never deliver, which would make a false
+      // pass the default outcome. Exits the instant the point of no
+      // return is reached, so a regression is observed positively rather
+      // than inferred from a silence. This is the PUMP, not the
+      // assertion — see below.
+      final parked = Stopwatch()..start();
+      while (!destructiveCloseReached && parked.elapsedMilliseconds < 300) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+
+      // The mechanism, as an ORDERING fact rather than a time-boxed
+      // absence: whenever closeDb reaches its destructive dispatch — now,
+      // or in ten seconds on a loaded box — the reader close it was
+      // supposed to join must ALREADY have completed. `expect(
+      // destructiveCloseReached, isFalse)` after a fixed 300 ms poll was
+      // the only assertion that changed colour when the join was
+      // reverted, and the regression path from the sweep to the dispatch
+      // is one PASSIVE-checkpoint worker round-trip — longer than 300 ms
+      // on a loaded CI box, where the regression would then PASS.
+      //
+      // Checked here as well as at the end, and deliberately BEFORE
+      // anything unparks the step: past a fired
+      // `debugBeforeDestructiveClose` the pool may already be gone, and
+      // releasing the step runs the parked close's finalizeStmt /
+      // poolReleaseReader straight into it — the SIGSEGV this test exists
+      // to observe without triggering.
+      if (destructiveCloseReached) {
+        expect(readerCloseSettledAtDestructiveClose, isTrue,
+            reason: 'closeDb reached its destructive closePool dispatch '
+                'while reader.close() was still in progress. The sweep read '
+                'isClosed == true as "nothing to do" and skipped a reader '
+                'that still holds a checked-out pool connection, so nothing '
+                'releases it and ClosePool waits on it forever');
+      }
+      expect(closeReturned, isFalse,
+          reason: 'closeDb settled while the reader close it must join was '
+              'still parked on its step');
+
+      release.complete();
+      expect(await row, isTrue,
+          reason: 'the parked step must still deliver its row — a close '
+              'that joined a FAILED step would prove nothing about the '
+              'ordering this test is named for');
+      await readerClose.timeout(const Duration(seconds: 5));
+      expect(readerCloseOutcome, isNull,
+          reason: '"closeDb joins the close" is meaningless if the close it '
+              'joined errored: the reader would still own its pool '
+              'connection');
+
+      // Bounded: on a regression closePool is parked on a worker isolate
+      // with a reader it will never get back, so an unbounded await would
+      // wedge the rest of the suite rather than fail this test.
+      var closeCompleted = true;
+      try {
+        await close.timeout(const Duration(seconds: 10));
+      } on TimeoutException {
+        closeCompleted = false;
+      }
+      expect(closeCompleted, isTrue,
+          reason: 'closeDb never returned. Its statement sweep skipped a '
+              'reader whose close was already in progress, so that '
+              "reader's pool connection was never handed back and "
+              'ClosePool is still waiting for it');
+      expect(closeOutcome, isNull,
+          reason: 'closeDb must complete, not merely settle');
+
+      // The ordering again, now on the path where teardown ran to
+      // completion — and with the witness that it ran at all, so a run
+      // that never reached the dispatch cannot pass by silence.
+      expect(destructiveCloseReached, isTrue,
+          reason: 'teardown never reached its destructive dispatch, so the '
+              'ordering this test is about was never observed');
+      expect(readerCloseSettledAtDestructiveClose, isTrue,
+          reason: 'closeDb reached its destructive closePool dispatch while '
+              'reader.close() was still in progress. The sweep read '
+              'isClosed == true as "nothing to do" and skipped a reader '
+              'that still holds a checked-out pool connection, so nothing '
+              'releases it and ClosePool waits on it forever');
+
+      // The second half of the fix, pinned where it is observable: the C
+      // pool struct lives until ClosePool RETURNS, and PoolReleaseReader
+      // is exactly the call it is blocked on — so a release arriving
+      // while the destructive dispatch is in flight must still be able to
+      // reach the pool. Dropping the pointer before the dispatch turns
+      // that release into a silent early return. (Asserted on what a
+      // release would USE, not on which field holds it: `_poolPtr` is
+      // deliberately cleared there, so that a second concurrent closeDb
+      // cannot dispatch closePool on the same pointer twice.)
+      expect(releasablePoolPtrAtDestructiveClose, livePoolPtr,
+          reason: 'the pool pointer a reader release would use was not the '
+              'live one when closePool was dispatched, so '
+              'releaseReaderConnectionInternal can only return early for '
+              'the whole duration of the call that is blocked waiting for '
+              'exactly that release');
+    } finally {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqlite.debugBeforeDestructiveClose = null;
+      // Unpark the step on the failing path too — but ONLY while that is
+      // still safe. Once `debugBeforeDestructiveClose` has fired the pool
+      // may be mid-ClosePool, and the parked close this would release
+      // runs finalizeStmt / poolReleaseReader straight into it: a SIGSEGV
+      // that kills the runner instead of failing this test. A step left
+      // parked leaks one suspended future and nothing else — the hook is
+      // one-shot, so no later test can reach it.
+      if (!release.isCompleted && !destructiveCloseReached) {
+        release.complete();
+      }
+      // Deliberately no reader.close() / stmt.close() on ANY path, and no
+      // dropDb until teardown actually finished: on a regression the pool
+      // is mid-ClosePool and touching it is the crash. setUpAll wipes
+      // test/db at the start of every run, so a skipped drop leaks
+      // nothing across runs.
+      if (closeReturned) await db.dropDb();
+    }
+  });
+
+  test(
+      'pool: closeDb joins a statement close that is already in progress '
+      'instead of skipping it', () async {
+    // The statement door into the same window. `DbasSqliteStatement
+    // .close()` latches its own `_closed` synchronously and then awaits
+    // the reader, so an un-awaited `stmt.close()` leaves a statement that
+    // reports closed while its reader still owns a pool connection. The
+    // sweep called `stmt.close()` again and got `if (_closed) return` —
+    // it never even reached the reader. Joining is what the reader's own
+    // `close()` has always done; the statement now has the same shape.
+    final db = await _createTestDb('pool_close_joins_inflight_stmt.db',
+        readerPoolSize: 2);
+    addTearDown(() {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqlite.debugBeforeDestructiveClose = null;
+    });
+    final release = Completer<void>();
+    var closeReturned = false;
+    Object? closeOutcome;
+    // Hoisted out of the `try` so the `finally` can read them — see the
+    // sibling test for why unparking the step is conditional.
+    var destructiveCloseReached = false;
+    bool? stmtCloseSettledAtDestructiveClose;
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      for (int i = 1; i <= 3; i++) {
+        await _runSql(db, 'INSERT INTO t VALUES ($i)');
+      }
+
+      var stmtCloseSettled = false;
+      DbasSqlite.debugBeforeDestructiveClose = (d) {
+        destructiveCloseReached = true;
+        stmtCloseSettledAtDestructiveClose = stmtCloseSettled;
+      };
+
+      final reached = Completer<void>();
+      DbasSqliteReader.debugInsideReadRowStep = () async {
+        DbasSqliteReader.debugInsideReadRowStep = null;
+        reached.complete();
+        await release.future;
+      };
+
+      final stmt = await db.prepareQuery('SELECT id FROM t ORDER BY id');
+      final reader = await stmt.executeReader();
+      final row =
+          reader.readRow().then<Object?>((r) => r, onError: (Object e) => e);
+      await reached.future;
+
+      final cached = Stopwatch()..start();
+      while (reader.getColumnText(0) != '1' &&
+          cached.elapsedMilliseconds < 2000) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      expect(reader.getColumnText(0), '1',
+          reason: 'the parked step never delivered its row, so this run '
+              'would prove nothing about what closeDb joins');
+
+      // `whenComplete` chained straight onto `close()`'s own future makes
+      // it listener NUMBER ONE on it, so `stmtCloseSettled` is true
+      // before the sweep's own `await` on the same future resumes — see
+      // the sibling test.
+      Object? stmtCloseOutcome;
+      final stmtClose = stmt
+          .close()
+          .whenComplete(() => stmtCloseSettled = true)
+          .then<Object?>(
+              (_) => null, onError: (Object e) => stmtCloseOutcome = e);
+      expect(stmt.isClosed, isTrue,
+          reason: 'close() must latch isClosed synchronously — that flag '
+              'being true while the reader underneath still owns its pool '
+              'connection is the whole hazard');
+
+      final close = db.closeDb().then<Object?>(
+        (_) => null,
+        onError: (Object e) => closeOutcome = e,
+      ).whenComplete(() => closeReturned = true);
+
+      // The PUMP, not the assertion — see the sibling test for why a
+      // fixed 300 ms absence passes the regression on a loaded box.
+      final parked = Stopwatch()..start();
+      while (!destructiveCloseReached && parked.elapsedMilliseconds < 300) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+
+      // Asserted here as well as at the end, and before anything unparks
+      // the step: past a fired `debugBeforeDestructiveClose` the pool may
+      // be mid-ClosePool, and the release would run the parked close's
+      // finalizeStmt / poolReleaseReader into it.
+      if (destructiveCloseReached) {
+        expect(stmtCloseSettledAtDestructiveClose, isTrue,
+            reason: 'closeDb reached its destructive closePool dispatch '
+                'while stmt.close() was still in progress. The sweep called '
+                'close() again and hit `if (_closed) return`, so the reader '
+                'underneath — still holding a checked-out pool connection — '
+                'was never reached and ClosePool waits on it forever');
+      }
+      expect(closeReturned, isFalse,
+          reason: 'closeDb settled while the statement close it must join '
+              'was still parked on its reader');
+
+      release.complete();
+      expect(await row, isTrue,
+          reason: 'the parked step must still deliver its row — a close '
+              'that joined a FAILED step would prove nothing about the '
+              'ordering this test is named for');
+      await stmtClose.timeout(const Duration(seconds: 5));
+      expect(stmtCloseOutcome, isNull,
+          reason: '"closeDb joins the close" is meaningless if the close it '
+              'joined errored: the reader underneath would still own its '
+              'pool connection');
+
+      var closeCompleted = true;
+      try {
+        await close.timeout(const Duration(seconds: 10));
+      } on TimeoutException {
+        closeCompleted = false;
+      }
+      expect(closeCompleted, isTrue,
+          reason: 'closeDb never returned. Its statement sweep skipped a '
+              'statement whose close was already in progress, so the pool '
+              'connection under it was never handed back and ClosePool is '
+              'still waiting for it');
+      expect(closeOutcome, isNull,
+          reason: 'closeDb must complete, not merely settle');
+      expect(destructiveCloseReached, isTrue,
+          reason: 'teardown never reached its destructive dispatch, so the '
+              'ordering this test is about was never observed');
+      expect(stmtCloseSettledAtDestructiveClose, isTrue,
+          reason: 'closeDb reached its destructive closePool dispatch while '
+              'stmt.close() was still in progress. The sweep called '
+              'close() again and hit `if (_closed) return`, so the reader '
+              'underneath — still holding a checked-out pool connection — '
+              'was never reached and ClosePool waits on it forever');
+    } finally {
+      DbasSqliteReader.debugInsideReadRowStep = null;
+      DbasSqlite.debugBeforeDestructiveClose = null;
+      // Gated exactly like the sibling test's: past the destructive
+      // dispatch the pool may be gone, and unparking the step there runs
+      // the parked close's native cleanup straight into it.
+      if (!release.isCompleted && !destructiveCloseReached) {
+        release.complete();
+      }
+      if (closeReturned) await db.dropDb();
+    }
+  });
+
+  test(
+      'pool: a second closeDb joins the first instead of racing it into the '
+      'destructive dispatch', () async {
+    // `closeDb` had no single-flight guard, and by the time the first
+    // call is suspended inside `closePool` every step of it
+    // short-circuits: `rollback` on `!_isInTransaction`, `_drainNativeOps`
+    // on an empty registry, the statement sweep on an already-cleared
+    // `_activeStatements`, the PASSIVE checkpoint on `!isOpened()`. So a
+    // second call walked the whole method in a handful of microtask turns
+    // — against a worker-isolate round trip — and did two wrong things:
+    //
+    //   1. it reported SUCCESS while the pool was still being destroyed,
+    //      which is a lie a caller may act on (`dropDb()` on a live pool
+    //      being the obvious one); and
+    //   2. it re-ran the capture-and-null with `poolPtr == null`. The
+    //      capture is atomic against the event loop, so only the FIRST
+    //      call ever gets a real pointer — the double-ClosePool
+    //      protection genuinely holds — but the LOSER used to execute the
+    //      assignment too, clearing `_closingPoolPtr` out from under the
+    //      winner for essentially the whole `closePool` window.
+    //      `releaseReaderConnectionInternal` then finds both fields null
+    //      and silently returns, which is the exact unbounded hang the
+    //      retained pointer exists to remove.
+    //
+    // The second close is issued from inside `debugBeforeDestructiveClose`
+    // because that is the one seam that runs at that instant:
+    // synchronously, after the capture-and-null and immediately before
+    // the dispatch. Nothing else in the library can be scheduled there.
+    final db = await _createTestDb('pool_close_concurrent_join.db',
+        readerPoolSize: 2);
+    addTearDown(() => DbasSqlite.debugBeforeDestructiveClose = null);
+    try {
+      await _runSql(db, 'CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await _runSql(db, 'INSERT INTO t VALUES (1)');
+
+      // The live pool pointer, so the assertions below can name WHICH
+      // pointer had to survive rather than merely that something did.
+      final livePoolPtr = db.debugReleasablePoolPtr;
+      expect(livePoolPtr, isNotNull,
+          reason: 'an open pooled database must have a pool pointer, or '
+              'nothing below proves anything');
+
+      var destructiveCloses = 0;
+      final releasableAtEachDispatch = <int?>[];
+      Future<void>? second;
+      Object? secondOutcome;
+      int? releasableWhenSecondReturned;
+      DbasSqlite.debugBeforeDestructiveClose = (d) {
+        destructiveCloses++;
+        releasableAtEachDispatch.add(d.debugReleasablePoolPtr);
+        // Issued here, synchronously, so it is genuinely concurrent with
+        // the `closePool` dispatch on the very next line of production
+        // code. Once only: on a regression this hook fires again, and a
+        // third close would just deepen the pile without proving more.
+        // The error handler is attached at construction — a rejection
+        // before the `await` below would otherwise land as an unhandled
+        // asynchronous error on whatever test is running.
+        second ??= d.closeDb().then<Object?>(
+          (_) {
+            // Read the instant the SECOND close reports completion. If
+            // the pool is really gone by then, `closePool` has returned
+            // and this caller was told the truth.
+            releasableWhenSecondReturned = d.debugReleasablePoolPtr;
+            return null;
+          },
+          onError: (Object e) => secondOutcome = e,
+        );
+      };
+
+      // Bounded: on a regression the second teardown can leave the first
+      // one's `closePool` waiting, and an unbounded await would wedge the
+      // rest of the suite rather than fail this test.
+      await db.closeDb().timeout(const Duration(seconds: 10));
+
+      expect(second, isNotNull,
+          reason: 'the hook never ran, so no second close was ever issued '
+              'and this run proves nothing');
+      await second!.timeout(const Duration(seconds: 10));
+      expect(secondOutcome, isNull,
+          reason: 'the joined close must complete, not merely settle');
+
+      // The pointer invariant FIRST, and deliberately: it holds however
+      // many teardowns reach the dispatch, so asserting it before the
+      // count keeps the two mechanisms separately diagnosable — the
+      // capture-and-null's `poolPtr != null` condition reddens here, the
+      // single-flight join reddens on the count below.
+      expect(releasableAtEachDispatch, everyElement(equals(livePoolPtr)),
+          reason: 'the pool pointer a reader release routes through was '
+              'cleared while closePool was still in flight. ClosePool '
+              'blocks on exactly that release, and with the pointer gone '
+              'releaseReaderConnectionInternal returns silently — the '
+              'unbounded hang this release exists to remove');
+      expect(destructiveCloses, 1,
+          reason: 'a second concurrent closeDb ran its own teardown to the '
+              'destructive dispatch instead of joining the first. Beyond '
+              'the duplicated work it reports success while the pool is '
+              'still being destroyed, which a caller may act on');
+      expect(releasableWhenSecondReturned, isNull,
+          reason: 'the second closeDb reported completion while a reader '
+              'release could still be routed into the pool, i.e. while '
+              'ClosePool had not returned and the pool was still being '
+              'destroyed');
+      expect(db.isOpened(), isFalse);
+    } finally {
+      DbasSqlite.debugBeforeDestructiveClose = null;
+      await db.dropDb();
     }
   });
 
@@ -8433,5 +9710,66 @@ void main() async {
                 DbasSqliteErrorCode.executeScriptDatabaseNotOpened)
             .having((e) => e.category, 'category',
                 DbasSqliteErrorCategory.notOpened)));
+  });
+
+  test(
+      "executeScript's registry label carries its SQL, like every other "
+      'statement-bearing call', () async {
+    // The drain-timeout message names every outstanding label, and its
+    // whole diagnostic value is saying WHICH call never handed back.
+    // executeScript is the DDL/migration door and the most likely
+    // long-running native call there is, so a bare 'executeScript' label
+    // is the one that identifies least. Truncated the same way
+    // executeReader's is — a script can be arbitrarily long.
+    final db = await _createTestDb('script_native_op_label.db');
+    addTearDown(() => DbasSqlite.debugNativeOpDrainTimeoutMs = null);
+    try {
+      // A script long enough to prove the truncation, with the
+      // identifying part up front where a truncated label keeps it.
+      final sql = 'CREATE TABLE script_label_probe (id INTEGER PRIMARY KEY, '
+          '${List.generate(20, (i) => 'col$i TEXT').join(', ')})';
+      expect(sql.length, greaterThan(80),
+          reason: 'the script must exceed the label budget or the '
+              'truncation below proves nothing');
+
+      // Zero, not a small number: the drain must expire on the first
+      // check, while the script is still registered. A script this short
+      // can finish inside any positive window, which would make the test
+      // pass or fail on machine speed.
+      DbasSqlite.debugNativeOpDrainTimeoutMs = 0;
+      // Un-awaited on purpose: the script is inside native code, so the
+      // drain has something real to time out on and the failure carries
+      // the label this test is about.
+      final script = db
+          .executeScript(sql)
+          .then<Object?>((r) => r, onError: (Object e) => e);
+
+      await expectLater(
+        db.closeDb(),
+        throwsA(isA<DbasSqliteException>()
+            .having((e) => e.code, 'code',
+                DbasSqliteErrorCode.closeDbNativeOpDrainTimeout)
+            .having((e) => e.message, 'message', contains('executeScript('))
+            .having((e) => e.message, 'message',
+                contains('CREATE TABLE script_label_probe'))
+            // Truncated, not verbatim: the last column of a 20-column
+            // script must not make it into the message.
+            .having((e) => e.message, 'message', isNot(contains('col19')))
+            // Every outstanding label now carries its own age, so one
+            // stuck call reads differently from ops churning.
+            .having((e) => e.message, 'message', contains('in flight'))),
+      );
+
+      DbasSqlite.debugNativeOpDrainTimeoutMs = null;
+      expect(await script, isA<int>(),
+          reason: 'the refused teardown must leave the script itself '
+              'untouched — that is the whole point of refusing');
+      // The documented remedy: let the work finish, then close again.
+      await db.closeDb();
+      expect(db.isOpened(), isFalse);
+    } finally {
+      DbasSqlite.debugNativeOpDrainTimeoutMs = null;
+      await db.dropDb();
+    }
   });
 }

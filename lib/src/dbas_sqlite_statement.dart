@@ -53,6 +53,30 @@ class DbasSqliteStatement {
   @visibleForTesting
   static Future<void> Function()? debugBeforeReaderTransfer;
 
+  /// Test-only rendezvous inside [executeScalar]'s one-row window —
+  /// after `executeReader` has handed back an OPEN reader and before the
+  /// single [DbasSqliteReader.readRow] that reads it. `null` in
+  /// production; the awaited call is the only cost when it is set.
+  ///
+  /// Exists because that window is the one stretch of [executeScalar]
+  /// nothing else can observe, and it is the window [executeScalar]'s
+  /// contract is about: a reader closed there makes the `readRow` throw
+  /// [DbasSqliteErrorCode.readerClosedDuringScan] instead of reporting
+  /// the `null` that means "no rows" — the one place in this release
+  /// where a throw replaces a value a caller may have been branching on.
+  ///
+  /// A seam is the only way to reach it. Every step from the reader's
+  /// construction to the `readRow` dispatch is pure Dart, so the window
+  /// is microtasks wide: another async flow is scheduled either wholly
+  /// before it or wholly after it, and `closeDb`'s sweep in particular
+  /// always loses (its drain costs strictly more hops — the ordering is
+  /// pinned by its own test).
+  ///
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static, so
+  /// a leaked hook would run inside every later `executeScalar`.
+  @visibleForTesting
+  static Future<void> Function()? debugBeforeScalarReadRow;
+
   final DbasSqlite _db;
   final DbasSqlitePlatform _platform;
   final String _sql;
@@ -62,6 +86,7 @@ class DbasSqliteStatement {
 
   DbasSqliteReader? _activeReader;
   bool _closed = false;
+  Future<void>? _closeFuture;
   int _lastAffectedRows = -1;
   int _lastInsertedId = -1;
   String? _lastError;
@@ -623,14 +648,10 @@ class DbasSqliteStatement {
   }
 
   /// Registry label for an in-flight native operation on this statement.
-  /// Carries the SQL — truncated, since
-  /// [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout] names every
-  /// outstanding label and a script can be arbitrarily long — so the
-  /// diagnostic says WHICH call never handed back, not just what kind.
-  String _nativeOpLabel(String verb) {
-    final sql = _sql.length <= 80 ? _sql : '${_sql.substring(0, 77)}...';
-    return '$verb($sql)';
-  }
+  /// Delegates to [DbasSqlite.nativeOpLabelInternal] so this statement's
+  /// labels and `executeScript`'s are derived the same way — see there.
+  String _nativeOpLabel(String verb) =>
+      DbasSqlite.nativeOpLabelInternal(verb, _sql);
 
   /// The connection-routing, prepare, bind and reader-handoff body of
   /// [executeReader]. Split out of [_executeReaderNative] so the
@@ -859,6 +880,10 @@ class DbasSqliteStatement {
       nameParams: nameParams,
     );
     try {
+      // Test-only rendezvous — see [debugBeforeScalarReadRow]. Inside the
+      // `try` so a hook that throws still runs the cleanup below.
+      final beforeReadRow = debugBeforeScalarReadRow;
+      if (beforeReadRow != null) await beforeReadRow();
       if (!await reader.readRow()) return null;
       return reader.getColumnValue(0);
     } finally {
@@ -912,15 +937,48 @@ class DbasSqliteStatement {
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   /// Closes any active reader, clears the bind buffers, and marks the
-  /// statement closed. Idempotent. Subsequent execute calls throw a
+  /// statement closed. Subsequent execute calls throw a
   /// [DbasSqliteException] with code [DbasSqliteErrorCode.statementClosed].
-  Future<void> close() async {
-    if (_closed) return;
+  ///
+  /// **Join-idempotent**, exactly like [DbasSqliteReader.close]: concurrent
+  /// callers all observe the same completion future, so a second caller
+  /// waits for the first call's cleanup to finish rather than returning
+  /// instantly while resources are still mid-tear-down.
+  ///
+  /// That distinction is load-bearing for `closeDb`'s statement sweep,
+  /// which is the second caller in the shape this exists for
+  /// (`unawaited(stmt.close())` then `closeDb()` — logout while a list
+  /// view is mid-scan). `_closed` is latched SYNCHRONOUSLY here and the
+  /// reader below then suspends — on its step drain and again on
+  /// `onClose`, whose `finalizeStmt` is a real worker dispatch — so a
+  /// returning-early second caller would walk on while this statement's
+  /// reader still holds a checked-out pool connection and a live
+  /// `sqlite3_stmt`. The sweep would then `_activeStatements.clear()` it
+  /// away, nothing would release the pool reader, and `ClosePool` — which
+  /// blocks until every checked-out reader is back — would wait forever.
+  Future<void> close() => _closeFuture ??= _doClose(teardown: false);
+
+  /// [close] for `closeDb`'s statement sweep, which is the one caller
+  /// that may truthfully describe itself as teardown — it is passed
+  /// through to the reader so that a `readerClosedDuringScan` raised
+  /// afterwards can say the database closed under the scan instead of
+  /// guessing between that and a deliberate `close()`. Identical to
+  /// [close] in every other respect, join-idempotency included.
+  Future<void> closeForTeardownInternal() =>
+      _closeFuture ??= _doClose(teardown: true);
+
+  Future<void> _doClose({required bool teardown}) async {
     _closed = true;
     final reader = _activeReader;
-    if (reader != null && !reader.isClosed) {
+    // No `!reader.isClosed` condition: [DbasSqliteReader.close] is itself
+    // join-idempotent, so this is cheap on the already-closed path and —
+    // the point — it JOINS a close that is already running instead of
+    // reading its synchronously-latched `isClosed` as "nothing to do".
+    if (reader != null) {
       try {
-        await reader.close();
+        await (teardown
+            ? reader.closeForTeardownInternal()
+            : reader.close());
       } catch (e, st) {
         developer.log(
           'reader.close failed during statement close',
