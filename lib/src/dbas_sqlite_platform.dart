@@ -2,6 +2,7 @@ import 'package:dbas_sqlite/src/native/dbas_sqlite_native_interface.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_db.dart'
     if (dart.library.js_interop) 'package:dbas_sqlite/src/stub/dbas_sqlite_db_stub.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_row_cache.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 /// Platform dispatcher — routes per-call work to the
 /// per-`dbName` [DbasSqliteNativeInterface] delegate. Stateless: every
@@ -27,6 +28,92 @@ final class DbasSqlitePlatform {
   }
 
   Future<void> initialize(String name) async => await _delegate[name]!.initialize();
+
+  /// Test-only seam: routes every later platform call for [dbName]
+  /// through [delegate] instead of the real one.
+  ///
+  /// **This map is the ONLY injection point there is.** A double for this
+  /// class itself is impossible — it is a `final class`, so nothing
+  /// outside its own library can extend or implement it — while
+  /// [DbasSqliteNativeInterface] is a plain abstract class and is what
+  /// every method above actually resolves through. Injecting here is
+  /// therefore not a shortcut around a nicer seam; it is the seam.
+  ///
+  /// What it exists to make reachable is the set of native outcomes the
+  /// real FFI layer cannot be asked to produce on demand: a specific
+  /// [PoolAcquireStatus], a `finalizeStmt` that fails, a `poolReleaseReader`
+  /// that can be OBSERVED rather than inferred. Wrap the real delegate
+  /// (`DbasSqliteNativeInterface.getInstance(dbName: dbName)`) and override
+  /// only the calls under test, so everything else keeps running against
+  /// real SQLite.
+  ///
+  /// Production behaviour is unchanged by the existence of this method:
+  /// nothing in this class reads a flag it sets, and with no test calling
+  /// it the map is populated exactly as before, lazily, by [_getInterface].
+  /// Pair it with [debugResetDelegates] in a `finally` / `addTearDown` —
+  /// the map is static, so a leaked wrapper would intercept every later
+  /// test's calls for that database.
+  @visibleForTesting
+  static void debugInjectDelegate(
+      String dbName, DbasSqliteNativeInterface delegate) {
+    // Recorded so [debugResetDelegates] can undo exactly this and nothing
+    // else. The PREVIOUS occupant is kept, not just the key: a reset that
+    // removed the key instead would leave the injected database with no
+    // entry at all, and every accessor above indexes the map with `!`.
+    _injectedDelegates[dbName] =
+        (injected: delegate, previous: _delegate[dbName]);
+    _delegate[dbName] = delegate;
+  }
+
+  /// Every delegate [debugInjectDelegate] has installed and not yet
+  /// undone, with the entry it displaced.
+  static final Map<
+      String,
+      ({
+        DbasSqliteNativeInterface injected,
+        DbasSqliteNativeInterface? previous
+      })> _injectedDelegates = {};
+
+  /// Undoes every [debugInjectDelegate] made since the last reset,
+  /// restoring the entry each one displaced.
+  ///
+  /// **Scoped to what was injected, and that scoping is load-bearing.**
+  /// This used to `clear()` the whole map, which is a process-wide effect
+  /// dressed up as a test teardown: the map is static and is never
+  /// cleared on close, so it accumulates an entry for every database the
+  /// run has ever touched — measured, the first call in this package's
+  /// suite dropped **fifteen** of them. Every accessor above resolves
+  /// through `_delegate[name]!` and only [_getInterface] ever repopulates
+  /// a key — and that is reached solely from [getInstance] / [createPool]
+  /// — so a cleared entry belonging to an OPEN database is never
+  /// repaired: its next call, `closeDb()` included, dies on a null-check
+  /// of a missing key and the database is left permanently unusable and
+  /// unclosable. That the suite stayed green only says none of those
+  /// fifteen happened to be open at that instant.
+  ///
+  /// Restoring rather than removing keeps the injected database usable
+  /// too: `DbasSqliteNativeInterface.getInstance` would hand back the
+  /// same per-`dbName` instance, so restoring is identity-preserving and
+  /// loses no native state, but it does not depend on a later
+  /// [_getInterface] that may never come.
+  ///
+  /// An entry someone else has since replaced is left alone — the same
+  /// identity guard, for the same reason, as the instance-map removals in
+  /// [DbasSqlite]: "undo my injection" is "restore this key" only while
+  /// the key still holds what this injected.
+  @visibleForTesting
+  static void debugResetDelegates() {
+    for (final entry in _injectedDelegates.entries) {
+      if (!identical(_delegate[entry.key], entry.value.injected)) continue;
+      final previous = entry.value.previous;
+      if (previous == null) {
+        _delegate.remove(entry.key);
+      } else {
+        _delegate[entry.key] = previous;
+      }
+    }
+    _injectedDelegates.clear();
+  }
 
   /// Direct access to the underlying delegate. Reserved for code
   /// paths that need access to platform-specific helpers not exposed

@@ -199,6 +199,16 @@ class DbasSqliteReader {
   }
 
   /// Whether this reader has been closed.
+  ///
+  /// Latches the INSTANT a close starts, before anything has been waited
+  /// for. Correct for "may I still use this reader?" — every consumer
+  /// entry point must refuse from that moment — but **not** for "is
+  /// native code done with this reader?". Nothing on this class answers
+  /// that second question, deliberately: an `isFullyClosedInternal` flag
+  /// set at the end of [_doClose] used to, and it was inert by
+  /// construction — see [DbasSqliteStatement.hasOpenWriterReaderInternal],
+  /// which is the only predicate that ever needed the distinction and
+  /// which gets it from the statement's own slot instead.
   bool get isClosed => _closed;
 
   /// Advances to the next row of the current result set.

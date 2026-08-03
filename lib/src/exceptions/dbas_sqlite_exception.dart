@@ -5,11 +5,11 @@
 /// the [DbasSqliteErrorCategory] returned by [DbasSqliteErrorCodeX.category].
 enum DbasSqliteErrorCode {
   // DbasSqlite — lifecycle
-  closeDbBusyWithStmtFinalizeFailures,
   closeDbBusyLeakedHandle,
   closeDbNativeOpDrainTimeout,
   prepareQueryDatabaseNotOpened,
   openDbReopenWithDifferentPoolSize,
+  attachDbInstanceSlotHeldByLiveInstance,
 
   // DbasSqlite — busy timeout
   setBusyTimeoutDatabaseNotOpened,
@@ -140,12 +140,11 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.acquireReaderConnectionNoPool:
         return DbasSqliteErrorCategory.notOpened;
 
-      case DbasSqliteErrorCode.closeDbBusyWithStmtFinalizeFailures:
       case DbasSqliteErrorCode.closeDbBusyLeakedHandle:
-      // Joins the two `closeDbBusy*` codes rather than `notOpened`: all
-      // three mean "teardown could not proceed because something was
-      // still using the connection", and the remedy is the same — let
-      // the outstanding work finish, then close again.
+      // Joins `closeDbBusyLeakedHandle` rather than `notOpened`: both
+      // mean "teardown could not proceed because something was still
+      // using the connection", and the remedy is the same — let the
+      // outstanding work finish, then close again.
       case DbasSqliteErrorCode.closeDbNativeOpDrainTimeout:
       case DbasSqliteErrorCode.setBusyTimeoutReaderBusy:
       case DbasSqliteErrorCode.readerSlotWaitTimeout:
@@ -153,6 +152,13 @@ extension DbasSqliteErrorCodeX on DbasSqliteErrorCode {
       case DbasSqliteErrorCode.writerLockWaitCancelled:
       case DbasSqliteErrorCode.writerLockWaitTimeout:
       case DbasSqliteErrorCode.executeReaderPoolAcquireTimeout:
+      // Joins the two `closeDb*` codes above for the same reason they
+      // join each other: another live instance is still holding this
+      // database's files, and the remedy is to let it finish (close it,
+      // or issue the attach on it) and try again. It is emphatically NOT
+      // `notOpened` — nothing here is closed; the problem is that
+      // something else is very much open.
+      case DbasSqliteErrorCode.attachDbInstanceSlotHeldByLiveInstance:
       // Sibling of the two `*WaitCancelled` codes rather than a
       // `readerStateFailed` one: nothing about the reader's lifecycle was
       // misused — an in-progress scan was cut short by something else

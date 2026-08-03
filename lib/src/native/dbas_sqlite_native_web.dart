@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 import 'package:web/web.dart' as web;
 
+import 'package:dbas_sqlite/src/dbas_sqlite.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_row_cache.dart';
 import 'package:dbas_sqlite/src/stub/dbas_sqlite_db_stub.dart'
     show
@@ -128,9 +129,14 @@ class DbasSqliteNativeWeb extends DbasSqliteNativeInterface {
   //     would be waiting on the gate. Leaving them ungated lets the
   //     open statement drain to completion while the destructive op
   //     waits for quiescence.
+  //   - [finalizeStmt] is the hand-off between those two counters and
+  //     counts itself into [_inFlightFinalizes] for the duration, since
+  //     it belongs to NEITHER while its worker round-trip is in flight
+  //     — it has already left [_stmts] and it was never gated.
   //   - [_teardownLivePool] raises [_exclusiveGate], waits for
-  //     quiescence (no in-flight calls, no open statements) bounded by
-  //     a timeout, then closes the pool and lowers the gate.
+  //     quiescence (no in-flight calls, no open statements, no in-flight
+  //     finalize) bounded by a timeout, then closes the pool and lowers
+  //     the gate.
 
   /// Non-null while a destructive op holds (or is waiting to hold)
   /// exclusive access. New gated work awaits its future.
@@ -138,8 +144,53 @@ class DbasSqliteNativeWeb extends DbasSqliteNativeInterface {
 
   /// Count of in-flight gated calls ([executeSql] / [prepareQuery] /
   /// [streamCopyDb]) that have passed the gate but not yet returned.
-  /// Combined with `_stmts.isEmpty`, defines pool quiescence.
+  /// Combined with `_stmts.isEmpty` and [_inFlightFinalizes], defines
+  /// pool quiescence.
   int _inFlightCalls = 0;
+
+  /// Count of [finalizeStmt] calls that have already removed their entry
+  /// from [_stmts] but have not yet finished the worker round-trip.
+  ///
+  /// **Load-bearing.** It is the reason quiescence cannot be
+  /// `_inFlightCalls == 0 && _stmts.isEmpty` alone. [finalizeStmt]
+  /// removes the statement FIRST — that removal is what makes a
+  /// double-dispatch impossible, so it has to stay — and only then
+  /// awaits `streamFinalize`. For the whole duration of that await the
+  /// finalize is in neither counter: out of [_stmts], and never in
+  /// [_inFlightCalls] because finalize is ungated (see the discipline
+  /// note above). Without this counter the pool reports itself QUIESCENT
+  /// with a finalize still in flight, and [_runExclusive] — whose entire
+  /// drain is guarded by `if (!_poolQuiescent)` — skips the drain
+  /// outright and closes the pool underneath it. That is the same
+  /// "close has STARTED read as close has FINISHED" error this release
+  /// fixes on the native side; on web the consequence is a rejected
+  /// worker RPC (`DbasSqliteWebPool.close` completes every pending
+  /// request with `StateError('Pool closed …')`) rather than native's
+  /// use-after-free, which lowers the severity but not the diagnosis.
+  ///
+  /// Message ordering was the previous defence — the finalize is posted
+  /// to the worker before the close is — and it is not sufficient. It
+  /// covers only the order the WORKER processes the two messages in; it
+  /// says nothing about the Dart-side pending RPC, which the close
+  /// rejects regardless, and nothing at all about the skipped drain,
+  /// which is what actually lets the close start early.
+  ///
+  /// Rejected alternatives:
+  ///   - Leave the entry in [_stmts] until the finalize completes and
+  ///     remove it in the `finally`. Quiescence would be honest with no
+  ///     second counter, but two concurrent `finalizeStmt(handle)` calls
+  ///     would then both find the state and both dispatch a finalize for
+  ///     the same cursor — the second landing on a cursor the worker has
+  ///     already released.
+  ///   - Route [finalizeStmt] through [_enterGated] / [_exitGated] so
+  ///     the existing counter covers it. That is precisely the deadlock
+  ///     the discipline note above rules out: the destructive op holds
+  ///     the gate while waiting for the statement to finalize, and the
+  ///     finalize would be waiting for the gate.
+  ///
+  /// Mirrors `DbasSqliteReader._inFlightSteps`, which exists on the
+  /// native side for exactly this reason.
+  int _inFlightFinalizes = 0;
 
   /// Completed by [_signalIfQuiescent] when the pool becomes quiescent,
   /// unblocking a destructive op waiting in [_teardownLivePool].
@@ -151,7 +202,21 @@ class DbasSqliteNativeWeb extends DbasSqliteNativeInterface {
   /// leaked op's next call gets a clean "Pool is closed".
   static const Duration _teardownDrainTimeout = Duration(seconds: 5);
 
-  bool get _poolQuiescent => _inFlightCalls == 0 && _stmts.isEmpty;
+  bool get _poolQuiescent =>
+      _inFlightCalls == 0 && _stmts.isEmpty && _inFlightFinalizes == 0;
+
+  /// TEST-ONLY witness for [_poolQuiescent] (named with a `debug` prefix
+  /// like [debugSwapLivePoolPreservingStatements]; not part of the public
+  /// contract, reachable only via the platform delegate).
+  ///
+  /// It is the only NON-DESTRUCTIVE way to observe the predicate mid-race.
+  /// The alternative — starting a destructive op inside the window and
+  /// checking whether it waits — cannot distinguish "the drain waited"
+  /// from "the finalize happened to win the race anyway": both worker
+  /// round-trips are real and either can settle first, and the shim
+  /// swallows the rejected finalize (`streamFinalize` logs rather than
+  /// throws), so the returned rc is `sqliteOk` on both sides of the fix.
+  bool get debugPoolQuiescent => _poolQuiescent;
 
   /// Enters a gated regular operation: waits behind any in-progress
   /// destructive op, then registers this call as in-flight. The
@@ -388,6 +453,27 @@ class DbasSqliteNativeWeb extends DbasSqliteNativeInterface {
     });
   }
 
+  /// **Known gap, recorded so it is not rediscovered as a surprise: this
+  /// is NOT atomic against a source that fails partway, and the native
+  /// implementation is.**
+  ///
+  /// `DbasSqliteNativeAppBase.attachStreamDb` writes a sibling temp and
+  /// renames it over the real path, so a stream that dies mid-transfer
+  /// leaves the previous database untouched. Web cannot mirror that from
+  /// here, because the destructive step is not in Dart: the worker's
+  /// `attachStreamBegin` opens the live database path with mode `w+`,
+  /// which truncates it before the first chunk arrives, and
+  /// `attachStreamAbort` unlinks that same path. Both live in the
+  /// prebuilt `web/libs/dbas_sqlite_worker.js`, whose source is the
+  /// separate `DBAS.SQLite` repository — closing this needs the chunked
+  /// protocol to write to a scratch path and swap at `attachStreamEnd`,
+  /// which is a change there, not here.
+  ///
+  /// A Dart-side workaround was considered and rejected: exporting the
+  /// existing database before the attach and re-attaching it on failure
+  /// materialises the whole database in Dart memory on the very path
+  /// [attachStreamDb] exists to keep out of memory, and still loses it
+  /// if the tab dies during the restore.
   @override
   Future attachStreamDb(String fileName, Stream<List<int>> stream) async {
     await _runExclusive(() async {
@@ -609,6 +695,13 @@ class DbasSqliteNativeWeb extends DbasSqliteNativeInterface {
   Future<int> finalizeStmt(int dbPtr, int handle) async {
     final state = _stmts.remove(handle);
     if (state == null) return sqliteOk; // already finalized / unknown
+    // Load-bearing, and load-bearing HERE: this runs synchronously after
+    // the `remove` above with no `await` between the two, so Dart's
+    // single-threaded loop cannot interleave anything, and there is no
+    // instant at which a destructive op can observe the pool as
+    // quiescent while this finalize is outstanding. Moving it below the
+    // first suspension point reopens the exact window it closes.
+    _inFlightFinalizes++;
     try {
       await state.pool.streamFinalize(state.cursor);
       return sqliteOk;
@@ -628,13 +721,21 @@ class DbasSqliteNativeWeb extends DbasSqliteNativeInterface {
       _captureError(e, 'finalizeStmt failed');
       return 1; // SQLITE_ERROR
     } finally {
-      // The statement was removed from [_stmts] above; if it was the
-      // last open statement (and no gated call is in flight) the pool
-      // is now quiescent — wake any destructive op waiting to tear
-      // down. Posting the finalize message happens synchronously inside
-      // `_pool!.finalizeStmt` before this finally's await-resumed
-      // continuation runs, so a teardown that proceeds here still sees
-      // the finalize FIFO-ordered ahead of its own `close` message.
+      // Pair for the increment above. A `finally` rather than a line
+      // after the await so a throwing finalize cannot leak the count:
+      // leaked, [_poolQuiescent] would be permanently false and every
+      // later destructive op would burn the full
+      // [_teardownDrainTimeout] before proceeding — a 5s stall traded
+      // for a race. (`streamFinalize` currently logs rather than
+      // rethrows, so today only the `return` paths are live; the
+      // `finally` is what keeps that a detail of the callee rather than
+      // a precondition of this method.)
+      _inFlightFinalizes--;
+      // The statement left [_stmts] before the round-trip and the
+      // round-trip has now finished, so if it was the last open
+      // statement — and no gated call is in flight — the pool is
+      // genuinely quiescent. Wake any destructive op waiting to tear
+      // down.
       _signalIfQuiescent();
     }
   }
@@ -1034,6 +1135,34 @@ class DbasSqliteNativeWeb extends DbasSqliteNativeInterface {
         try {
           await idle.future.timeout(_teardownDrainTimeout);
         } on TimeoutException {
+          // Reported, not silent. Past this line the destructive op runs
+          // anyway and [_teardownLivePool] destroys the pool, so whatever
+          // the drain was still waiting for is severed — a leaked
+          // statement's next call gets "Pool is closed", which is the
+          // designed outcome, but an in-flight FINALIZE that was merely
+          // SLOW is severed just the same and its caller learns nothing.
+          // [_inFlightFinalizes] added that second route: it counts a real
+          // round trip rather than a leak, so a loaded worker can miss the
+          // deadline with nothing actually wrong.
+          //
+          // The three counters go out by name because they are what says
+          // WHICH of those it was, and no caller can read them afterwards
+          // — the reset below is the first thing that happens.
+          // [DbasSqlite.reportDiagnosticInternal] rather than
+          // `developer.log` alone for this package's usual reason: that
+          // sink is dropped whenever no VM service client is subscribed.
+          DbasSqlite.reportDiagnosticInternal(
+            'web: the pool quiescence drain timed out after '
+            '${_teardownDrainTimeout.inMilliseconds}ms with '
+            '_inFlightCalls=$_inFlightCalls, _stmts=${_stmts.length}, '
+            '_inFlightFinalizes=$_inFlightFinalizes. The destructive '
+            'operation proceeds and the live pool is destroyed, so anything '
+            'still counted above is severed: an open statement gets "Pool is '
+            'closed" on its next call, and a finalize still in flight never '
+            'reports its result. A non-zero _inFlightFinalizes here usually '
+            'means a slow worker rather than a leak.',
+            name: 'dbas_sqlite.DbasSqliteNativeWeb',
+          );
           _quiescent = null;
         }
       }

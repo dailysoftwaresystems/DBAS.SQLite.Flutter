@@ -119,16 +119,46 @@ class DbasSqliteStatement {
   /// WAL pool read doesn't touch the writer connection) and whenever no
   /// reader is open on this statement.
   ///
-  /// Internal seam for [DbasSqlite.commit]'s pre-flight check. Safe for
-  /// it to reach this only through `_activeStatements`: a statement is
-  /// removed from that set exactly once, on the last line of [close],
-  /// and [close] first awaits `reader.close()` — which flips the
-  /// reader's `isClosed` synchronously — so this getter is already
-  /// `false` before the statement can leave the set.
+  /// Internal seam for [DbasSqlite.commit]'s pre-flight check.
+  ///
+  /// **Load-bearing: "open" here has to mean DRAIN-COMPLETE, not
+  /// close-started**, and the SLOT is what says so. This getter must not
+  /// consult any flag that flips when a close *starts*.
+  ///
+  /// It previously read [DbasSqliteReader.isClosed], justified by the
+  /// observation that a statement leaves `_activeStatements` only on the
+  /// last line of [close], and [close] first awaits `reader.close()` —
+  /// which flips `isClosed` synchronously — "so this getter is already
+  /// `false` before the statement can leave the set". That argument is
+  /// sound and it proves the wrong thing: what it establishes is that the
+  /// getter goes `false` EARLY. For a predicate whose `false` authorises
+  /// `COMMIT`, and the `_releaseWriterLock()` after it that hands the
+  /// writer to the next FIFO waiter to prepare, bind, step and finalize
+  /// on, early is precisely the failure — the one the refusal's own
+  /// message describes. Late is survivable: a caller that gets
+  /// [DbasSqliteErrorCode.commitBlockedByActiveReader] closes its reader
+  /// and commits again, with nothing disturbed.
+  ///
+  /// `_activeReader` itself carries the drain-complete fact and needs no
+  /// help doing it. It is cleared in ONE place — the identity-guarded
+  /// clear at the end of the `onClose` closure in [executeReader] — which
+  /// runs after that closure has read its counters, finalized the
+  /// `sqlite3_stmt` and released the connection, and which the reader's
+  /// own `_doClose` reaches only after its in-flight `sqlite3_step`s have
+  /// drained. So the slot goes empty exactly when native code is finished
+  /// with this reader, never before.
+  ///
+  /// A second flag on the reader (`isFullyClosedInternal`, set at the end
+  /// of `_doClose`) was added here and has been **removed**: it could only
+  /// ever lag that clear, never lead it, so no reachable state
+  /// distinguished the two forms — `_activeReader != null &&
+  /// _activeReader!.isFullyClosedInternal` is unreachable by
+  /// construction. Three separate mutations of it left the whole suite
+  /// green while the two writer-reader tests still killed a revert to
+  /// `isClosed`, which is the shape of a mechanism that is advertised as
+  /// live and is inert.
   bool get hasOpenWriterReaderInternal =>
-      _activeReader != null &&
-      !_activeReader!.isClosed &&
-      _activeReaderUsesWriter;
+      _activeReader != null && _activeReaderUsesWriter;
 
   // ── Bindings (positional, fluent) ────────────────────────────────────
 
@@ -739,7 +769,15 @@ class DbasSqliteStatement {
       final beforeReaderTransfer = debugBeforeReaderTransfer;
       if (beforeReaderTransfer != null) await beforeReaderTransfer();
 
-      final reader = DbasSqliteReader.internal(
+      // Declared ahead of the constructor call, not initialised by it, so
+      // that `onClose` below can capture this scope's OWN reader for its
+      // identity check — Dart forbids an initialiser referencing the
+      // variable it initialises, even from inside a closure. The `late`
+      // cannot fail: `onClose` is invoked only from
+      // [DbasSqliteReader.close], and no caller can hold this reader to
+      // close it until the assignment below has completed.
+      late final DbasSqliteReader reader;
+      reader = DbasSqliteReader.internal(
         conn: conn,
         handle: handle,
         platform: _platform,
@@ -752,6 +790,22 @@ class DbasSqliteStatement {
           // Order is load-bearing: read counters BEFORE finalize, then
           // release. We track the first error and log subsequent ones
           // so no failure is silently dropped if multiple steps fail.
+          //
+          // Each phase reports through BOTH sinks, and each sink carries
+          // something the other cannot. `developer.log` is the only one
+          // that takes the error object and its stack — and only the
+          // FIRST failure's stack survives the rethrow at the end of
+          // this closure, so phases two and three have no other route
+          // for theirs at all. [DbasSqlite.reportDiagnosticInternal] is
+          // the only one a consumer can actually READ: `developer.log`
+          // publishes to the VM service `Logging` stream and is dropped
+          // whenever no client is subscribed, which is every release
+          // build on a device and every `flutter test` run — i.e.
+          // exactly where these failures cost something. That is the
+          // same pairing `closeDb`'s statement sweep uses, and the
+          // reason each message below names the specific resource or
+          // result that was lost: "onClose failed" is not a diagnosis.
+          // See [DbasSqlite.onDiagnostic].
           Object? firstErr;
           StackTrace? firstStack;
           try {
@@ -769,6 +823,15 @@ class DbasSqliteStatement {
               error: e,
               stackTrace: st,
             );
+            DbasSqlite.reportDiagnosticInternal(
+              'reader onClose: reading the per-statement counters failed '
+              '($e). getAffectedRows(), getLastInsertedId() and the '
+              'last-error accessors on this statement keep whatever they '
+              'were last given, and the handle is finalized immediately '
+              'below — so those values can never be obtained again for '
+              'this execution. Teardown continues.',
+              name: 'dbas_sqlite.DbasSqliteStatement',
+            );
           }
           try {
             await _platform.finalizeStmt(conn, handle);
@@ -780,6 +843,16 @@ class DbasSqliteStatement {
               name: 'dbas_sqlite.DbasSqliteStatement',
               error: e,
               stackTrace: st,
+            );
+            DbasSqlite.reportDiagnosticInternal(
+              'reader onClose: finalizing the sqlite3_stmt failed ($e). '
+              'That handle is leaked for the lifetime of the process. On '
+              'the pool path closeDb() still returns normally — ClosePool '
+              'force-closes — so this report is the only signal you get; '
+              'on the single-connection path it is what makes a later '
+              'closeDb() come back SQLITE_BUSY. The connection this '
+              'reader holds is released below regardless.',
+              name: 'dbas_sqlite.DbasSqliteStatement',
             );
           }
           try {
@@ -793,8 +866,45 @@ class DbasSqliteStatement {
               error: e,
               stackTrace: st,
             );
+            DbasSqlite.reportDiagnosticInternal(
+              'reader onClose: releasing this reader\'s connection failed '
+              '($e). What is stranded depends on how the read was routed: '
+              'a POOL reader stays checked out for the lifetime of the '
+              'process and ClosePool — which blocks until every '
+              'checked-out reader is back — makes a later closeDb() hang '
+              'with no timeout on that path; a SINGLE-CONNECTION read '
+              'leaves the writer lock held, so every later write and '
+              'every transaction parks behind it forever.',
+              name: 'dbas_sqlite.DbasSqliteStatement',
+            );
           }
-          _activeReader = null;
+          // The identity check is load-bearing: a predecessor's DELAYED
+          // cleanup must never clear a successor's claim. `close()` latches
+          // the reader's `isClosed` synchronously and only then suspends —
+          // on its step drain and again on this very closure's
+          // `finalizeStmt` / `releaseFn`, both real worker round trips —
+          // while `executeReader`'s admission guard reads exactly that
+          // flag. So a SECOND reader is legitimately admitted and
+          // published into `_activeReader` before this runs, and clearing
+          // unconditionally would erase the only slot anything can reach
+          // it through: `closeDb`'s statement sweep would find `null`,
+          // close nothing, and `_activeStatements.clear()` would disown
+          // the statement — after which the POOL route deadlocks
+          // (`ClosePool` waits on a reader nobody will release) and the
+          // WRITER route lets `commit()`'s pre-flight see a quiescent
+          // writer and commit out from under a live cursor. Admitting the
+          // successor is correct — serialising close-then-requery instead
+          // was considered and rejected — so the fix belongs here.
+          //
+          // Both fields clear together, under the one check, for the
+          // reason [_activeReaderUsesWriter] documents: the pair can never
+          // be allowed to disagree. Guarding only `_activeReader` would
+          // leave `hasOpenWriterReaderInternal` reporting `false` for a
+          // live writer-bound successor.
+          if (identical(_activeReader, reader)) {
+            _activeReader = null;
+            _activeReaderUsesWriter = false;
+          }
           if (firstErr != null) {
             Error.throwWithStackTrace(firstErr, firstStack!);
           }

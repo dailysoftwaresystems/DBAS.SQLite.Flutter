@@ -183,6 +183,33 @@ class DbasSqlite {
   @visibleForTesting
   static int? debugNativeOpDrainTimeoutMs;
 
+  /// How long [_drainReentrantWriterOps] waits for the in-transaction
+  /// writes it is draining before it starts logging that it is still
+  /// waiting, and the interval it repeats at.
+  ///
+  /// It does **not** bound the wait, and nothing else does either — this
+  /// drain runs inside [rollback], which [closeDb] calls BEFORE
+  /// [_drainNativeOps], so [kNativeOpDrainTimeoutMs] is upstream of
+  /// nothing here and never fires for it. The same shape as
+  /// [DbasSqliteReader.kStepDrainStallReportMs], for the same reason: a
+  /// `.timeout()` would not cancel the drain, it would ABANDON it, and
+  /// the detached `rollback()` could then issue a real `ROLLBACK` on the
+  /// connection after [_performClose] had already moved on to the
+  /// destructive dispatch. What it exists for is to stop "unbounded" also
+  /// meaning "silent": a `closeDb()` livelocked behind an un-awaited
+  /// in-transaction `executeSql` is otherwise indistinguishable from a
+  /// slow one. Wire [onDiagnostic] to actually receive the report; the
+  /// `dart:developer` copy reaches nobody in a release build or under
+  /// `flutter test`.
+  static const int kReentrantWriterDrainStallReportMs = 5000;
+
+  /// Test-only override for [kReentrantWriterDrainStallReportMs], so the
+  /// stall report can be exercised in milliseconds. Same rationale as
+  /// [debugPoolAcquireTimeoutMs]; reset it to `null` in a `finally` /
+  /// `addTearDown`, it is static. Values below 1 ms are clamped to 1 ms.
+  @visibleForTesting
+  static int? debugReentrantWriterDrainStallReportMs;
+
   /// Where this package publishes diagnostics that have **no other way
   /// out**. `null` by default; wire it once, at app start.
   ///
@@ -200,17 +227,35 @@ class DbasSqlite {
   /// one place the problems they describe do not usually happen.
   ///
   /// What reports through here:
-  ///   - [DbasSqliteReader.close]'s stall report — the one wait in this
-  ///     library that is deliberately **unbounded** and that no timeout
-  ///     will ever surface, so a teardown wedged behind a step that never
-  ///     hands back is otherwise indistinguishable from a slow one;
-  ///   - [closeDb]'s count of statements that failed to finalize, which
-  ///     on the pool path leaks a handle without failing the close; and
+  ///   - [DbasSqliteReader.close]'s stall report — one of the two waits
+  ///     in this library that are deliberately **unbounded** and that no
+  ///     timeout will ever surface, so a teardown wedged behind a step
+  ///     that never hands back is otherwise indistinguishable from a slow
+  ///     one;
+  ///   - [_drainReentrantWriterOps]' stall report — the other one, and
+  ///     the one [closeDb] reaches FIRST, through `rollback()`: a
+  ///     teardown livelocked behind an un-awaited in-transaction
+  ///     `executeSql` never even reaches the drain
+  ///     [kNativeOpDrainTimeoutMs] bounds;
+  ///   - a failure in any of the three phases of the reader teardown
+  ///     closure in [DbasSqliteStatement.executeReader] — the counter
+  ///     read, the `finalizeStmt` and the connection release — each of
+  ///     which loses a different resource or result that nothing
+  ///     downstream can recover or even name; and
   ///   - a `poolReleaseReader` that threw inside [setBusyTimeout], which
-  ///     strands a reader `ClosePool` will block on.
+  ///     strands a reader `ClosePool` will block on; and
+  ///   - a `rollback()` that FAILED inside [closeDb]'s teardown — either
+  ///     of the two attempts. Teardown deliberately continues past one,
+  ///     which means the WAL fold two steps later is issued against a
+  ///     connection that still holds a transaction, folds nothing, and
+  ///     lets `closeDb()` return SUCCESS with committed frames still in
+  ///     the `-wal`. `closeDb`'s documented escape hatch — "call
+  ///     `rollback()` yourself first if you need to react" — does not
+  ///     reach the post-drain case at all: that transaction did not exist
+  ///     when the caller could have.
   ///
-  /// All three describe resources that are already lost or about to
-  /// wedge, on paths whose return value cannot say so.
+  /// All of them describe resources or results that are already lost or
+  /// about to wedge, on paths whose return value cannot say so.
   ///
   /// **Called synchronously from teardown paths, and it must BE
   /// synchronous.** The type is `void Function(String)`, and Dart accepts
@@ -230,7 +275,23 @@ class DbasSqlite {
   /// [onDiagnostic]. Package-internal — see [onDiagnostic] for why both
   /// sinks exist and why a throwing consumer sink is swallowed here.
   static void reportDiagnosticInternal(String message, {required String name}) {
-    developer.log(message, name: name);
+    // Guarded, and not merely tidy. This method is called BETWEEN teardown
+    // phases — the reader `onClose` closure reports its counter read, then
+    // finalizes the statement, then releases the connection — so anything
+    // that escapes from here skips every phase after it, and a release that
+    // never runs strands a pool checkout `ClosePool` blocks on forever.
+    // `developer.log` is not expected to throw for a plain message and a
+    // plain name, which is exactly why it used to sit ahead of the guard;
+    // "not expected to" is not the standard the rest of this method is
+    // written to, and it is the standard the callers need.
+    var publishedToDeveloperLog = false;
+    try {
+      developer.log(message, name: name);
+      publishedToDeveloperLog = true;
+    } catch (_) {
+      // Nothing left to report THIS through; the consumer sink below is
+      // the other half of the job and still gets its turn.
+    }
     final sink = onDiagnostic;
     if (sink == null) return;
     try {
@@ -249,14 +310,22 @@ class DbasSqlite {
       // about a wedged teardown. `Zone.current.print` reaches logcat /
       // oslog in a release build and stdout under `flutter test`, so the
       // ORIGINAL message goes out through it too, not just the failure.
-      developer.log(
-        'DbasSqlite.onDiagnostic threw while reporting a diagnostic; the '
-        'message above was still published to dart:developer and the '
-        'operation that reported it continues.',
-        name: name,
-        error: e,
-        stackTrace: st,
-      );
+      try {
+        developer.log(
+          'DbasSqlite.onDiagnostic threw while reporting a diagnostic; the '
+          '${publishedToDeveloperLog ? 'message above was still published '
+              'to dart:developer' : 'original message did not reach '
+              'dart:developer either'}, and the operation that reported it '
+          'continues.',
+          name: name,
+          error: e,
+          stackTrace: st,
+        );
+      } catch (_) {
+        // Same guard as above, for the same reason: a `developer.log`
+        // that cannot publish must not turn this handler into the escape
+        // the handler exists to prevent.
+      }
       try {
         Zone.current.print(
           '[$name] DbasSqlite.onDiagnostic threw ($e); the diagnostic it '
@@ -282,6 +351,65 @@ class DbasSqlite {
   /// Reset it to `null` in a `finally` / `addTearDown`; it is static.
   @visibleForTesting
   static void Function(DbasSqlite db)? debugBeforeDestructiveClose;
+
+  /// Test-only rendezvous that HOLDS teardown at the START of its
+  /// destructive window — after the capture-and-null above, before the
+  /// `closePool` / `closeDb` dispatch is issued. Awaited at the same
+  /// instant [debugBeforeDestructiveClose] is invoked, immediately after
+  /// it. `null` in production; the awaited call is the only cost when it
+  /// is set.
+  ///
+  /// **It cannot hold the window open until that dispatch RETURNS**, and
+  /// a test that needs the later half of the window has to park somewhere
+  /// else: this hook has already returned by the time `closePool` is
+  /// called, so the stretch a release actually races — the one where
+  /// `ClosePool` is blocked waiting for the very checkout that release
+  /// returns — is downstream of it. The seam for that half is inside the
+  /// platform delegate's own `closePool`, which a test can wrap.
+  ///
+  /// The two are NOT redundant. [debugBeforeDestructiveClose] is
+  /// synchronous by construction — it exists to sample state at an exact
+  /// instant, and awaiting there would change the very ordering it
+  /// reports. This one is the opposite: it exists to keep that window
+  /// OPEN for as long as a test needs, because the window is a state no
+  /// caller can otherwise be held in — `_db` is already null (so
+  /// `isOpened()` already reads false) while the native pool is still
+  /// fully alive and still holding the database files. Every defect that
+  /// reads "close has started" as "close has finished" is reachable only
+  /// from inside it, and nothing out here can stall a worker-isolate
+  /// dispatch mid-flight to reproduce it — the alternative, racing a real
+  /// `closePool` round trip against a handful of `File` operations, makes
+  /// the test a property of the machine rather than of the code.
+  ///
+  /// Held here the pool is still intact, which is what makes the park
+  /// SAFE: nothing is mid-destruction, so a test may observe and assert
+  /// freely before releasing it.
+  ///
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static, so
+  /// a leaked hook would park every later test's teardown.
+  @visibleForTesting
+  static Future<void> Function()? debugInsideDestructiveClose;
+
+  /// Test-only rendezvous inside [beginTransaction]'s dispatch window —
+  /// after the writer lock has been granted and the native operation
+  /// registered, immediately before the `BEGIN TRANSACTION` dispatch.
+  /// `null` in production; the awaited call is the only cost when it is
+  /// set.
+  ///
+  /// Exists because that window is the one stretch of [beginTransaction]
+  /// no other seam can observe, and it is the window teardown's
+  /// correctness turns on: the call already holds the writer lock and is
+  /// already registered as in-flight native work, yet `_isInTransaction`
+  /// is still `false` — so [_performClose]'s `rollback()` finds nothing
+  /// to roll back and only [_drainNativeOps] waits for it. A caller
+  /// parked here is exactly the straggler whose transaction becomes
+  /// visible DURING that drain.
+  ///
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static, so
+  /// a leaked hook would park every later test's first
+  /// `beginTransaction`.
+  @visibleForTesting
+  static Future<void> Function()? debugBeforeBeginTransactionDispatch;
 
   static final Map<String, DbasSqlite> _instance = {};
 
@@ -465,14 +593,15 @@ class DbasSqlite {
   /// [attachStreamDb], which writes chunks incrementally without
   /// holding the whole file in memory.
   Future<DbasSqlite> attachDb(List<int> bytes, {bool openDb = true}) async {
-    if (_instance.containsKey(dbName)) {
-      if (_instance[dbName]!.isOpened()) {
-        await _instance[dbName]!.closeDb();
-      }
-      _instance.remove(dbName);
-    }
-
+    // Resolved BEFORE the guard below, deliberately, and for exactly
+    // [dropDb]'s reason: it is what leaves no suspension point between the
+    // guard's final, synchronous slot decision and the dispatch that acts
+    // on it. Left where it was, an `await` sat inside the very gap the
+    // decision exists to close. An ARGUED invariant, uncovered by any
+    // test — see [dropDb] for why one cannot easily be written.
     final fileName = await getAppDatabasePath(dbName: dbName);
+    await _releaseInstanceSlotForAttach();
+
     await _platform.attachDb(fileName, bytes);
     final instance = await getInstance(dbName: dbName);
     if (openDb) await instance.openDb();
@@ -489,19 +618,127 @@ class DbasSqlite {
   /// large enough that the in-memory [attachDb] would be wasteful.
   Future<DbasSqlite> attachStreamDb(Stream<List<int>> stream,
       {bool openDb = true}) async {
-    if (_instance.containsKey(dbName)) {
-      if (_instance[dbName]!.isOpened()) {
-        await _instance[dbName]!.closeDb();
-      }
-      _instance.remove(dbName);
-    }
-
+    // Resolved before the guard — see [attachDb] for why the order matters.
     final fileName = await getAppDatabasePath(dbName: dbName);
+    await _releaseInstanceSlotForAttach();
+
     await _platform.attachStreamDb(fileName, stream);
     final instance = await getInstance(dbName: dbName);
     if (openDb) await instance.openDb();
     return instance;
   }
+
+  /// Stands the receiver down from [dbName]'s instance slot before an
+  /// attach replaces the file underneath it.
+  ///
+  /// Shared by [attachDb] and [attachStreamDb] so the two doors into an
+  /// attach cannot drift apart — and they had already drifted from every
+  /// other caller, by driving both halves of this decision off the MAP
+  /// rather than off the receiver. `_instance[dbName]!.closeDb()` closes
+  /// whatever the map currently holds, which is `this` only while nothing
+  /// has taken the slot over; and the removal that followed fired
+  /// unconditionally. A **stale reference** — an instance whose own
+  /// [closeDb] has already released the slot, which stays a perfectly
+  /// usable Dart object and is exactly what a consumer that cached one
+  /// holds — therefore tore down a LIVE successor it has nothing to do
+  /// with, and then disowned it as well.
+  ///
+  /// Both halves now name `this`: the close is the receiver's own, and the
+  /// removal fires only while the slot is still the receiver's claim —
+  /// the same identity guard [_performClose] applies, for the same reason.
+  ///
+  /// **Load-bearing on the removal, defensive on the close.** The removal
+  /// is the half a stale reference actually reaches. The close cannot
+  /// diverge from the old form today: with teardown's removal placed after
+  /// its destructive dispatch, and [openDb] joining an in-flight teardown,
+  /// an OPEN instance is always the one the map holds — so `this` and
+  /// `_instance[dbName]` coincide wherever `isOpened()` is true. It is
+  /// written this way regardless, because "closes something other than the
+  /// receiver" is not a property any method should be one refactor away
+  /// from.
+  ///
+  /// **Joins an in-flight teardown first, and that join is load-bearing —
+  /// for [dropDb]'s reason, reached by [dropDb]'s route.** `isOpened()` is
+  /// the wrong predicate on its own and wrong in the dangerous direction:
+  /// [_performClose] nulls `_db` BEFORE awaiting the destructive dispatch,
+  /// so it reads FALSE for that entire window while the C pool still holds
+  /// the `.db`, the `-wal`, the `-shm` and the `-journal`. An attach that
+  /// sampled it there skipped the close, found the slot still its own,
+  /// removed it MID-TEARDOWN, and handed the file to
+  /// [DbasSqliteNativeInterface.attachDb] — whose first act is a
+  /// file-level `dropDb`, i.e. those four unlinks under a live pool. On
+  /// POSIX the unlink succeeds and the closing pool goes on writing into
+  /// an inode with no name, re-creating sidecars beside the NEWLY ATTACHED
+  /// database: a foreign `-wal`, which opens with no error and silently
+  /// serves another database's rows while passing `integrity_check` (see
+  /// [streamCopyDb], which deletes its destination's sidecars for exactly
+  /// this). Meanwhile the removed slot lets [getInstance] build a second
+  /// instance whose [openDb] sees `_closingDb == null` and so cannot join
+  /// the teardown at all.
+  ///
+  /// **A slot occupied by someone else is REFUSED, not closed.** This is
+  /// the decision the old map-driven form made by accident and the
+  /// identity-guarded form made by omission, and neither is safe: the old
+  /// one closed a live successor the caller has nothing to do with, the
+  /// new one left it open while the attach unlinked its files underneath
+  /// it — after which [getInstance] hands that successor back and its
+  /// [openDb] either early-returns with a handle bound to a deleted inode
+  /// (silent data loss, no error) or throws a pool-size mismatch.
+  ///
+  /// Refusing is chosen over closing on the merits. Closing is a
+  /// destructive side effect on an object this caller does not own and
+  /// cannot report to: the successor's consumer holds statements and
+  /// readers that would fail mid-scan, its instance would silently become
+  /// closed, and nothing in this call could tell it why — which is the
+  /// very action-at-a-distance the identity guards elsewhere in this class
+  /// exist to remove. Refusing touches nothing at all: the file, the
+  /// successor's pool and the successor's slot are exactly as they were,
+  /// the caller learns which instance holds the database, and the retry is
+  /// theirs to sequence. It is also the direction this library takes
+  /// everywhere else a call would otherwise proceed over live state —
+  /// [DbasSqliteErrorCode.commitBlockedByActiveReader] is the same trade,
+  /// and late is survivable where destructive is not.
+  ///
+  /// A slot held by a QUIESCENT other instance is left alone and the
+  /// attach proceeds. That instance holds no files, so there is nothing to
+  /// corrupt and nothing to refuse over — and evicting it is the original
+  /// defect. It stays in the map, and it is what [getInstance] hands back
+  /// once the file has been replaced.
+  Future<void> _releaseInstanceSlotForAttach() async {
+    final inFlightClose = _closingDb;
+    if (inFlightClose != null) await inFlightClose;
+    if (isOpened()) await closeDb();
+
+    // Synchronous from here to the caller's dispatch — see [attachDb] on
+    // why the path is resolved before this method is called.
+    final occupant = _instance[dbName];
+    if (identical(occupant, this)) {
+      _instance.remove(dbName);
+      return;
+    }
+    if (occupant != null && occupant._holdsDatabaseFiles) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.attachDbInstanceSlotHeldByLiveInstance,
+        'Cannot attach over "$dbName": this DbasSqlite is no longer the '
+        'instance registered for that name, and the one that is still holds '
+        'the database files. Replacing the file underneath it would unlink '
+        'the .db, -wal, -shm and -journal out from under a live connection. '
+        'Close that instance first, or issue the attach on it — '
+        'DbasSqlite.getInstance(dbName: "$dbName") returns it.',
+      );
+    }
+  }
+
+  /// Whether this instance may still be holding [dbName]'s files.
+  ///
+  /// Broader than `isOpened()` on purpose, in both directions it can be:
+  /// `_db` is nulled BEFORE teardown's destructive dispatch, so
+  /// [isOpened] reads false while the C pool still has every file open,
+  /// and an [openDb] in flight is about to have them. Anything deciding
+  /// whether it may replace or unlink those files must read this, never
+  /// [isOpened] — see [_releaseInstanceSlotForAttach].
+  bool get _holdsDatabaseFiles =>
+      isOpened() || _opening != null || _closingDb != null;
 
   /// Copies the current database to a new database with the given
   /// [destDbName]. Streamed chunk-by-chunk.
@@ -548,11 +785,102 @@ class DbasSqlite {
   }
 
   /// Deletes the database file (including WAL and SHM journal files).
+  ///
+  /// **Joins a teardown already in flight, and that join is
+  /// load-bearing.** `isOpened()` alone is the wrong predicate here, and
+  /// wrong in the dangerous direction: it means "teardown has started
+  /// FINISHING", not "the connection is gone". [_performClose] nulls
+  /// `_db` BEFORE awaiting the destructive `closePool` / `closeDb`
+  /// dispatch — deliberately, so a main-isolate accessor reading `_db`
+  /// while a worker isolate frees the pool sees a CLOSED connection
+  /// instead of a freed pointer — so `isOpened()` reads false for the
+  /// whole of that dispatch, while the C pool is still folding the `-wal`
+  /// and still holding all three files open. A drop that sampled it there
+  /// skipped the join entirely and unlinked those files underneath: a
+  /// pool checkpointing on into an inode with no name where the unlink
+  /// succeeds, and a raised `FileSystemException` with no drop performed
+  /// where the platform refuses to delete an open file. It also removed
+  /// this database's platform delegate mid-teardown, which turns a later
+  /// `poolReleaseReader` into a raw `TypeError` the reader's `onClose`
+  /// swallows — leaving the checkout unreturned and `ClosePool` blocked
+  /// with no diagnostic.
+  ///
+  /// [_closingDb] is the handle to join because it is non-null for
+  /// exactly that window and no other: [closeDb] publishes it in the
+  /// synchronous prefix of [_performClose], before anything can observe
+  /// teardown's first effect, and clears it only once that future
+  /// completes — i.e. after the dispatch has returned and the pool struct
+  /// is freed. The join cannot wait on itself either: nothing inside
+  /// teardown re-enters this method ([attachDb] / [attachStreamDb] reach
+  /// the platform's own file-level `dropDb`, never this one), so the
+  /// future being awaited never depends on this call.
+  ///
+  /// A teardown that FAILS propagates its error out of here rather than
+  /// being swallowed, which is both [closeDb]'s own single-flight-join
+  /// contract and the safe reading: a close that could not finish may
+  /// still hold the files.
+  ///
+  /// **`isOpened()` is a RE-CHECK, not the `else` it used to be.** Reading
+  /// it once, before the join, would be the same defect this method just
+  /// stopped committing one line up — a decision taken from a sample the
+  /// wait itself invalidates. A caller that opened the database while the
+  /// joined teardown was finishing leaves the pool live again, and an
+  /// `else` never looks.
+  ///
+  /// **One re-check, and — unlike [_performClose]'s post-drain rollback —
+  /// that bound is a CONTRACT, not a proof.** There, one retry pass was
+  /// provably sufficient: `_isInTransaction` is set in exactly one place,
+  /// under an exclusive writer lock, while [_closing] rejects every new
+  /// acquire, so at most one straggler can exist and none can appear after
+  /// it. Nothing of that kind holds here — [openDb] is public, ungated and
+  /// callable at any moment — so `while (isOpened())` would have no
+  /// termination argument at all: a caller that keeps reopening starves
+  /// the drop forever. A fixed number of passes would be an arbitrary
+  /// constant guaranteeing nothing. Neither is written.
+  ///
+  /// What IS closed is the window this method's own wait opens: `fileName`
+  /// is resolved BEFORE the join, so between the re-check and the
+  /// `_platform.dropDb` dispatch there is **no suspension point** and
+  /// nothing can run there at all, let alone finish an open. Leaving the
+  /// path resolution where it was left an `await` sitting inside the very
+  /// gap the re-check exists to close, which is half a fix.
+  ///
+  /// **That is an ARGUED invariant, not a covered one**, and it is
+  /// recorded as such rather than dressed up: no test pins the placement,
+  /// and moving the resolve back below the re-check leaves the whole suite
+  /// green. Exploiting the gap needs an [openDb] — a `createPool` round
+  /// trip across a worker isolate — to COMPLETE inside a path resolve, and
+  /// there is no seam over that resolve to hold one there, so a test for
+  /// it would be a race against the machine rather than a property of the
+  /// code. What the invariant asks of a future edit is therefore plain:
+  /// an `await` reintroduced between the re-check and the dispatch reopens
+  /// the window, and nothing in this repository will turn red when it
+  /// does. [attachDb] and [attachStreamDb] carry the same placement for
+  /// the same reason and with the same caveat.
+  ///
+  /// What is NOT closed is stated rather than papered over: `dropDb()` is
+  /// **not atomic against a caller that reopens the database while this
+  /// call is closing it**. Arbitrating that needs an admission gate over
+  /// [openDb] that no version of this library has; it is a caller-side
+  /// ordering error, and one this method cannot see.
+  ///
+  /// With [openDb]'s own join in place the re-check is **defensive**: no
+  /// open can COMPLETE while [_closingDb] is non-null, so the instance is
+  /// normally not open when the join returns. It is kept because one
+  /// interleaving still reaches it — an open already past that join when
+  /// the close started, completing during it — and because on the
+  /// no-teardown-in-flight path it is the original, load-bearing branch,
+  /// unchanged.
   Future<void> dropDb() async {
     if (!await databaseExists()) return;
+    // Resolved before the join below, deliberately: it is what leaves no
+    // suspension point between the re-check and the dispatch.
+    final fileName = await getAppDatabasePath(dbName: dbName);
+
+    final inFlightClose = _closingDb;
+    if (inFlightClose != null) await inFlightClose;
     if (isOpened()) await closeDb();
 
-    final fileName = await getAppDatabasePath(dbName: dbName);
     await _platform.dropDb(fileName);
   }
 
@@ -569,7 +897,50 @@ class DbasSqlite {
   /// [DbasSqliteErrorCode.openDbReopenWithDifferentPoolSize] — pool
   /// resizing isn't supported; close the database first if you need to
   /// change the pool size.
+  ///
+  /// **Waits for a teardown already in flight.** A [closeDb] that has not
+  /// returned still owns the connection whatever `isOpened()` reports, and
+  /// a teardown that FAILS surfaces its error here rather than being
+  /// swallowed — see the join at the top of the body.
   Future<void> openDb({int readerPoolSize = 4}) async {
+    // Join an in-flight teardown BEFORE anything else, the idempotency
+    // check below included.
+    //
+    // `isOpened()` is no admission check against a close: it reads `_db`,
+    // which [_performClose] nulls BEFORE awaiting the destructive
+    // `closePool` / `closeDb` dispatch — deliberately, so a main-isolate
+    // FFI accessor cannot be handed a pointer the C side is freeing — so
+    // it reads FALSE for that entire window while the C pool is still
+    // alive and still holding all three files. An open arriving there
+    // walked straight past the guard and called `createPool` on a file
+    // whose previous pool was mid-destruction: `POOL_ALREADY_ACTIVE` on
+    // web, and on native two C pools over one file, each with its own
+    // writer and its own independent Dart writer lock, sharing the one
+    // static platform delegate. It also cleared [_closing] and
+    // republished the reader semaphore underneath a teardown that had
+    // just cancelled both.
+    //
+    // Placing teardown's instance-slot removal after that dispatch does
+    // not cover this on its own — it changes WHICH object races the
+    // destruction, not whether one does, and a caller holding this
+    // reference races it with the same outcome. The two are halves of one
+    // fix: with no open able to complete while [_closingDb] is set, an
+    // instance cannot be OPEN again at the moment its own teardown
+    // releases the slot, which is what makes that guard sound.
+    //
+    // **Cannot wait on itself.** Nothing inside teardown re-enters this
+    // method: [attachDb] / [attachStreamDb] reach it only on the instance
+    // [getInstance] hands back, and only after their own `closeDb()` has
+    // returned and cleared [_closingDb].
+    //
+    // **Not a cure for an open that was already in flight when the close
+    // started** — that one is past this line and lands its `createPool`
+    // whenever it lands. Closing it needs cross-single-flight arbitration
+    // between [openDb] and [closeDb], which is a different mechanism from
+    // this join and out of scope here.
+    final inFlightClose = _closingDb;
+    if (inFlightClose != null) await inFlightClose;
+
     if (isOpened()) {
       _assertReopenPoolSize(readerPoolSize);
       return;
@@ -637,6 +1008,22 @@ class DbasSqlite {
     // caller retains the instance reference across close→open, and on
     // the [attachDb] / [attachStreamDb] `openDb: true` paths.
     _closing = false;
+    // **Defensive**, and it is the other half of the reason
+    // [_cancelWriterWaitQueue] no longer clears this flag: with teardown
+    // out of that business, a hold nothing released is carried across the
+    // whole close, and the line above is what would then hand it to the
+    // next connection. A writer lock is scoped to a connection, so
+    // inheriting one means every writer on the new connection queues
+    // behind a holder that cannot exist any more — until its
+    // [kWriterLockWaitTimeoutMs] expires, one caller at a time.
+    //
+    // Sound only HERE. [openDb] returns early on an already-open
+    // instance, so this runs on a connection that is not open, where no
+    // holder this could disown exists: every acquire is rejected while
+    // [_closing], and a teardown that ran ended the transaction that owned
+    // the lock. Mirrors the [_readerSlotsAvailable] reset below, which
+    // republishes the reader semaphore for the same reason.
+    _writerLockHeld = false;
 
     if (readerPoolSize > 0) {
       final poolPtr = await _platform.createPool(dbName, fileName, readerPoolSize);
@@ -915,6 +1302,18 @@ class DbasSqlite {
   /// failing (through [onDiagnostic], which is the only sink that
   /// reaches a release build).
   ///
+  /// The `rollback()` below is the OTHER wait that bound does not cover,
+  /// and this one runs **before** it: `rollback()` waits for every write
+  /// dispatched inside the transaction (see [_drainReentrantWriterOps])
+  /// and that wait is **unbounded** too — see its docs for why a
+  /// `.timeout()` there would abandon the rollback rather than cancel it,
+  /// and could reopen the race the post-drain re-check closes. So
+  /// `closeDb()` on a connection with an un-awaited in-transaction
+  /// `executeSql` blocks for as long as that write takes, with no
+  /// ceiling, and [kNativeOpDrainTimeoutMs] is never even reached; the
+  /// drain reports a stall every [kReentrantWriterDrainStallReportMs]
+  /// instead of failing (through [onDiagnostic], for the same reason).
+  ///
   /// **The sweep JOINS a close that is already running** rather than
   /// skipping it. `close()` on both a statement and a reader latches
   /// `isClosed` synchronously and then suspends, so an un-awaited
@@ -943,8 +1342,11 @@ class DbasSqlite {
   /// pool was still being destroyed**, which is a lie a caller may act
   /// on, `dropDb()` on a live pool being the obvious one. Nothing
   /// re-enters this method from inside teardown, so the join can never
-  /// wait on itself: [dropDb] calls it only behind `isOpened()`, and
-  /// [attachDb] / [attachStreamDb] only from outside a close.
+  /// wait on itself: [dropDb] joins [_closingDb] first and only reaches
+  /// this method afterwards, by which point that teardown has finished
+  /// and cleared the marker (the `finally` below is registered on it
+  /// before any other waiter, so it runs first), and [attachDb] /
+  /// [attachStreamDb] arrive only from outside a close.
   Future<void> closeDb() async {
     final inFlight = _closingDb;
     if (inFlight != null) {
@@ -998,17 +1400,53 @@ class DbasSqlite {
     _cancelWriterWaitQueue();
     _cancelReaderSlotWaitQueue();
 
-    try {
-      await rollback();
-    } catch (e, st) {
-      developer.log(
-        'closeDb: rollback of in-flight transaction failed; '
-        'continuing teardown',
-        name: 'dbas_sqlite.DbasSqlite',
-        error: e,
-        stackTrace: st,
-      );
+    // Both rollback attempts below run through this, so the "log it and
+    // carry on" contract is written once. A failure here must never skip
+    // statement cleanup, queue cancellation and pool close — see
+    // [closeDb]'s docs.
+    Future<void> rollbackBestEffort(String phase) async {
+      try {
+        await rollback();
+      } catch (e, st) {
+        // BOTH sinks, and the [onDiagnostic] one is not decoration here.
+        // `rollback()` clears `_isInTransaction` in its `finally` whether
+        // or not the ROLLBACK succeeded, so teardown walks on; the WAL
+        // fold two steps down then runs against a connection SQLite still
+        // considers to be in a transaction, folds nothing, and reports
+        // that shortfall to `developer.log` as well — and `closeDb()`
+        // returns SUCCESS with committed frames still sitting in the
+        // `-wal`. That is precisely the silent data loss the post-drain
+        // re-check was added to prevent, recreated on the re-check's own
+        // failure path, and `developer.log` alone cannot tell anyone: it
+        // is dropped whenever no VM service client is subscribed, i.e.
+        // every release build and every `flutter test` run. `closeDb`'s
+        // documented escape hatch does not cover it either — for the
+        // post-drain attempt the transaction did not exist when the
+        // caller could have rolled it back themselves.
+        //
+        // `developer.log` is kept alongside because it is the only sink
+        // that carries the error object and its stack trace.
+        developer.log(
+          'closeDb: rollback of in-flight transaction failed ($phase); '
+          'continuing teardown',
+          name: 'dbas_sqlite.DbasSqlite',
+          error: e,
+          stackTrace: st,
+        );
+        reportDiagnosticInternal(
+          'closeDb("$dbName"): rolling back an in-flight transaction failed '
+          '($phase): $e. Teardown CONTINUES — a failed rollback must not '
+          'skip the statement sweep, the queue cancellations or the pool '
+          'close — but the WAL fold that follows cannot fold a connection '
+          'that still holds a transaction, so closeDb() may well return '
+          'successfully with committed frames left in the -wal. Treat this '
+          'as "the database closed but its WAL may not have been folded".',
+          name: 'dbas_sqlite.DbasSqlite',
+        );
+      }
     }
+
+    await rollbackBestEffort('before the native-operation drain');
 
     // Wait for every operation that already crossed into NATIVE code to
     // hand back — BEFORE the statement sweep below.
@@ -1046,6 +1484,33 @@ class DbasSqlite {
     // closes it, and on the pool route nothing releases its reader.
     await _drainNativeOps();
 
+    // Roll back AGAIN if a transaction became visible while we drained.
+    //
+    // **The rollback above cannot cover this, and its absence is silent
+    // data loss.** [beginTransaction] publishes `_isInTransaction` only
+    // AFTER its `BEGIN` dispatch returns — the very round trip the drain,
+    // not that rollback, is what waits for. So a [beginTransaction] that
+    // was already granted the writer lock when [_closing] latched
+    // completes DURING the drain, and teardown would resume into a
+    // transaction that did not exist when it looked: the fold below
+    // early-returns (SQLite refuses to checkpoint a connection holding a
+    // transaction), so `closeDb()` returns SUCCESS with committed frames
+    // still sitting in the `-wal`, and the `ROLLBACK` that transaction
+    // needed is never issued at all.
+    //
+    // **A check-and-retry, not a loop, and that bound is provable rather
+    // than assumed.** Only [beginTransaction] ever sets the flag, and it
+    // does so holding the writer lock. That lock is exclusive, so at most
+    // ONE caller can be inside it; [_closing] rejects every new
+    // [_acquireWriterLock], and [_cancelWriterWaitQueue] above emptied the
+    // queue a hand-off could have come from — so no second caller can
+    // reach the dispatch, and there is at most one straggler to catch.
+    // Once this rollback clears the flag and releases the lock, nothing
+    // can set it again.
+    if (_isInTransaction) {
+      await rollbackBestEffort('after the native-operation drain');
+    }
+
     // Close every still-open statement (which closes its active reader
     // if any). List.of() snapshots the set since close() mutates it.
     //
@@ -1056,7 +1521,6 @@ class DbasSqlite {
     // still holding a checked-out pool connection, so a sweep that
     // treated the flag as "nothing to do" would disown that reader on the
     // `clear()` below and leave `ClosePool` waiting on it forever.
-    int stmtCloseFailures = 0;
     for (final stmt in List.of(_activeStatements)) {
       try {
         // The teardown-flavoured close: identical work, but it lets a
@@ -1065,7 +1529,38 @@ class DbasSqlite {
         // deliberate `close()` the consumer made themselves.
         await stmt.closeForTeardownInternal();
       } catch (e, st) {
-        stmtCloseFailures++;
+        // **Defensive, not load-bearing** — and the distinction is the
+        // whole reason nothing downstream is allowed to depend on it.
+        //
+        // As the code stands `closeForTeardownInternal()` CANNOT throw.
+        // It memoizes [DbasSqliteStatement._doClose], whose only failable
+        // step is the reader close — and that one is caught there and
+        // logged without a rethrow, while everything after it (two field
+        // assignments and a `Set.remove`) is incapable of raising. So
+        // this catch is unreachable today, on every route.
+        //
+        // It stays anyway, because "unreachable today" is a property of
+        // another class's current implementation and not a contract this
+        // call site may assume. If a future edit lets `_doClose`
+        // propagate, an unguarded `await` here would abandon the sweep on
+        // the first failure and leave every statement after it
+        // unfinalized — and, on the pool route, their readers never
+        // released, which is precisely the `ClosePool` wedge the drain
+        // above and this sweep exist to prevent.
+        //
+        // Deliberately counted and reported no further, which is a
+        // reversal: a `stmtCloseFailures` counter fed only from here,
+        // the `onDiagnostic` report that read it, and the
+        // `closeDbBusyWithStmtFinalizeFailures` throw arm it gated were
+        // all pinned at zero by the same unreachability, so what they
+        // advertised was never delivered. The consequence they described
+        // could not arise either: the reader's `onClose` releases the
+        // connection in a THIRD, separate `try`, unconditionally, so a
+        // finalize that fails still hands the pool reader back and can
+        // strand nothing. What remains is a leaked `sqlite3_stmt`, which
+        // this log reports honestly — and reporting an unreachable site
+        // to [onDiagnostic] is what produced the false claim in the
+        // first place.
         developer.log(
           'closeDb: statement close failed for "$dbName"',
           name: 'dbas_sqlite.DbasSqlite',
@@ -1076,31 +1571,6 @@ class DbasSqlite {
     }
     _activeStatements.clear();
 
-    // Reported to the consumer sink, not just counted.
-    //
-    // The count below is read only by the SINGLE-CONNECTION branch, and
-    // only when `CloseDb` came back `SQLITE_BUSY`. On the POOL path — the
-    // default for every real app — `ClosePool` force-closes and this
-    // method returns SUCCESS, so a statement that failed to finalize
-    // leaks (possibly with the pool reader its abandoned reader still
-    // holds) with nothing in the return value to say so. `developer.log`
-    // above is not a report: it is dropped whenever no VM service client
-    // is subscribed, which is every release build and every
-    // `flutter test` run. See [onDiagnostic].
-    if (stmtCloseFailures > 0) {
-      reportDiagnosticInternal(
-        'closeDb("$dbName"): $stmtCloseFailures tracked statement(s) failed '
-        'to finalize during the teardown sweep. Their native handles — and, '
-        'for a statement with an open reader, the pool connection it had '
-        'checked out — may be leaked for the lifetime of the process. On the '
-        'pool path this does NOT fail closeDb(): ClosePool force-closes and '
-        'this call still returns normally, so this report is the only signal '
-        'you get. See the prior dart:developer entries for the underlying '
-        'errors.',
-        name: 'dbas_sqlite.DbasSqlite',
-      );
-    }
-
     // Fold the WAL into the main `.db` file BEFORE the connection goes
     // away.
     //
@@ -1110,7 +1580,10 @@ class DbasSqlite {
     //   1. `rollback()` above — a checkpoint issued while a transaction
     //      is still open folds NOTHING (SQLite refuses to checkpoint a
     //      connection holding one), so checkpointing before the
-    //      rollback would strand every already-committed frame.
+    //      rollback would strand every already-committed frame. Its
+    //      post-drain re-check belongs to this step, not to the drain: a
+    //      transaction that became visible while we drained strands the
+    //      same frames just as silently.
     //   2. the native-operation drain above — a read still in
     //      `executeReader`'s prepare window is not yet an open reader,
     //      so the sweep in step 3 cannot see it at all.
@@ -1130,10 +1603,6 @@ class DbasSqlite {
     // has the database open.
     await _checkpointBeforeRawFileAccess('closeDb("$dbName")',
         takeWriterLock: false);
-
-    if (_instance.containsKey(dbName)) {
-      _instance.remove(dbName);
-    }
 
     // Capture the handles into locals, and null `_db` BEFORE awaiting the
     // destructive dispatch below.
@@ -1182,6 +1651,12 @@ class DbasSqlite {
     final debugHook = debugBeforeDestructiveClose;
     if (debugHook != null) debugHook(this);
 
+    // Test-only rendezvous — see [debugInsideDestructiveClose]. Placed
+    // after the synchronous hook above so that hook keeps reporting the
+    // instant it always did.
+    final insideWindow = debugInsideDestructiveClose;
+    if (insideWindow != null) await insideWindow();
+
     if (poolPtr != null) {
       try {
         await _platform.closePool(dbName, poolPtr);
@@ -1194,10 +1669,14 @@ class DbasSqlite {
       }
     } else if (conn != null) {
       // Single-connection fallback. Tracked statements above should
-      // have finalised every handle; if CloseDb returns SQLITE_BUSY
-      // it means at least one handle is still live — either tracked
-      // statements that failed to finalise (stmtCloseFailures > 0) or
-      // a handle leaked outside our tracking. Surface the right one.
+      // have finalised every handle; if CloseDb returns SQLITE_BUSY it
+      // means at least one is still live. There is only one way that can
+      // happen and so only one code to raise: a handle leaked OUTSIDE
+      // the tracked set. The sweep above cannot contribute one — it
+      // cannot fail (see its catch) — so a second arm distinguishing
+      // "a tracked statement failed to finalize" described a state
+      // unreachable by construction and has been removed rather than
+      // left standing as a branch no run can ever take.
       //
       // `checkpoint: false` is deliberate and must stay false: the
       // C-side flag runs `wal_checkpoint(TRUNCATE)`, which waits out the
@@ -1216,16 +1695,6 @@ class DbasSqlite {
         final err = _platform.getLastDbError(conn) ?? 'live handles';
         final primaryRc = _platform.getErrorCode(conn) ?? rc;
         final uniqueRc = _platform.getUniqueErrorCode(conn);
-        if (stmtCloseFailures > 0) {
-          throw DbasSqliteException.sqlite(
-            DbasSqliteErrorCode.closeDbBusyWithStmtFinalizeFailures,
-            'Cannot close database "$dbName": $err. '
-            '$stmtCloseFailures tracked statement(s) failed to finalize '
-            '(see prior log entries for the underlying errors).',
-            sqliteCode: primaryRc,
-            sqliteUniqueCode: uniqueRc,
-          );
-        }
         throw DbasSqliteException.sqlite(
           DbasSqliteErrorCode.closeDbBusyLeakedHandle,
           'Cannot close database "$dbName": $err. '
@@ -1236,6 +1705,45 @@ class DbasSqlite {
         );
       }
     }
+
+    // Release this database's instance slot — AFTER the destructive
+    // dispatch above, and only while the slot is still THIS instance's
+    // claim.
+    //
+    // **The position is load-bearing.** Removed before the dispatch, the
+    // map published "gone" while the pool was still being destroyed, so a
+    // [getInstance] arriving in that window built a SECOND [DbasSqlite]
+    // for this file — and its [openDb] would then call `createPool` on a
+    // file whose previous pool was mid-destruction. On web the JS pool
+    // rejects that with `POOL_ALREADY_ACTIVE`; on native two C pools
+    // coexist over one file, each with its own writer and its own
+    // independent Dart writer lock, and — because
+    // `DbasSqlitePlatform._delegate` is a static map that is never cleared
+    // on close — both driving the one platform delegate. Held until here,
+    // that window resolves to the instance that is closing, which is the
+    // truthful answer: this database is not gone yet.
+    //
+    // **The identity guard is load-bearing separately.** The map is keyed
+    // by NAME while every writer of it means BY OBJECT, and
+    // `remove(dbName)` is "remove me" only while nothing else holds the
+    // slot. A second `closeDb()` on a stale reference — closed, still
+    // referenced, torn down again on the way out — arrives here with
+    // nothing of its own left to release and would evict a live successor,
+    // leaving the next [getInstance] to build a third object over that
+    // successor's pool.
+    //
+    // Sound only because [openDb] joins an in-flight teardown: without
+    // that join a caller could have re-opened THIS instance during the
+    // dispatch above, and the guard — correctly identifying the slot as
+    // ours — would then disown an instance that is open again.
+    //
+    // Deliberately NOT in a `finally`, which also preserves the old
+    // ordering's behaviour: a teardown that throws (the native-op drain
+    // timeout is the reachable case, and it already threw upstream of the
+    // removal's old position) leaves the connection alive and asks the
+    // caller to await the outstanding work and close again — so the
+    // instance must stay discoverable for exactly that retry.
+    if (identical(_instance[dbName], this)) _instance.remove(dbName);
   }
 
   // ── New: prepare / utilities ─────────────────────────────────────────
@@ -1940,6 +2448,10 @@ class DbasSqlite {
           'Database was closed while waiting for writer lock.',
         );
       }
+      // Test-only rendezvous — see [debugBeforeBeginTransactionDispatch].
+      final beforeDispatch = debugBeforeBeginTransactionDispatch;
+      if (beforeDispatch != null) await beforeDispatch();
+
       final rc = await _platform.executeSql(_db!, 'BEGIN TRANSACTION');
       if (rc != sqliteOk) {
         final err = _platform.getLastDbError(_db!) ?? 'rc=$rc';
@@ -2194,9 +2706,11 @@ class DbasSqlite {
     int? rollbackPrimaryRc;
     int? rollbackUniqueRc;
     String rollbackDetail = '';
-    // `closeDb` calls this BEFORE its native-operation drain, so the
-    // registration here is always ended before that drain starts — it
-    // can never wait on itself.
+    // `closeDb` calls this BEFORE its native-operation drain — and, when
+    // a straggler opened a transaction during that drain, once more after
+    // it. Either way the registration here is ended before this method
+    // returns, and the post-drain call runs when that drain has already
+    // finished, so neither can ever wait on itself.
     final nativeOp = beginNativeOpInternal('rollback');
     try {
       final rc = await _platform.executeSql(_db!, 'ROLLBACK');
@@ -2603,6 +3117,35 @@ class DbasSqlite {
   @visibleForTesting
   int get debugWriterLockWaitQueueLength => _writerWaitQueue.length;
 
+  /// Whether the Dart-side writer lock is held right now. Test-only seam,
+  /// and the only witness there is for the flag's OWNERSHIP rule: the
+  /// lock's holder is not a queue entry anything can count — a granted
+  /// acquire leaves the queue empty and [debugWriterLockWaitQueueLength]
+  /// reads the same `0` whether the lock is held or free. Reading it
+  /// mid-teardown is what tells a hold that survived from a hold that was
+  /// cleared by something which never owned it; see
+  /// [_cancelWriterWaitQueue].
+  @visibleForTesting
+  bool get debugWriterLockHeld => _writerLockHeld;
+
+  /// Rejects every caller parked on the writer-lock FIFO queue. Called
+  /// once, at the top of [_performClose].
+  ///
+  /// **It deliberately does NOT touch [_writerLockHeld], because it does
+  /// not own it.** Only the actual holder's [_releaseWriterLock] may
+  /// clear that flag. Clearing it here clears it UNDER a live holder —
+  /// a `beginTransaction` or an `executeSql` that was granted the lock
+  /// before [_closing] latched and is still inside its dispatch. That is
+  /// inert for as long as [_closing] rejects every acquire, and it turns
+  /// live the moment [_performOpen] clears [_closing]: a new acquire is
+  /// granted while the pre-close holder still believes it owns the lock,
+  /// and that holder's eventual [_releaseWriterLock] then hands the lock
+  /// to a SECOND waiter — two concurrent owners, and the Dart-side
+  /// writer serialization is void.
+  ///
+  /// [_performOpen] resets the flag instead, which is the only place a
+  /// reset is sound: it runs on a connection that is not open, so no
+  /// holder it could disown exists.
   void _cancelWriterWaitQueue() {
     while (_writerWaitQueue.isNotEmpty) {
       _writerWaitQueue.removeFirst().completeError(
@@ -2612,7 +3155,6 @@ class DbasSqlite {
         ),
       );
     }
-    _writerLockHeld = false;
   }
 
   // ── Async reader-slot semaphore (FIFO) ───────────────────────────────
@@ -2622,6 +3164,25 @@ class DbasSqlite {
   /// load-bearing: the C reader is returned to the pool BEFORE the
   /// Dart slot is released, so when the next caller's await resumes
   /// the C-side acquire is guaranteed to find a free reader.
+  ///
+  /// **`timeoutMs <= 0` is the NON-BLOCKING form, and this method honours
+  /// it by throwing rather than by waiting.** That is not a local
+  /// convention: [acquireReaderConnectionInternal] passes the very same
+  /// value straight through to `poolAcquireReaderBlocking` precisely
+  /// because it is "the documented 'non-blocking' form on the C side", so
+  /// a Dart gate that read it as "wait, with no deadline" would give one
+  /// parameter two opposite meanings in two adjacent layers — and the
+  /// meaning that wins would be the one that never returns.
+  ///
+  /// Parking anyway was the previous behaviour and is rejected on its own
+  /// merits too: the timer below was the ONLY thing that could ever fail a
+  /// queued waiter, so with no timer installed the waiter could be
+  /// completed only by an unrelated [_releaseReaderSlot] or by teardown's
+  /// [_cancelReaderSlotWaitQueue] — an unbounded wait entered by a caller
+  /// that asked not to wait at all, on the one path with no deadline to
+  /// surface it. Throwing [DbasSqliteErrorCode.readerSlotWaitTimeout] is
+  /// the same failure an expired deadline raises, because it describes the
+  /// same fact: no slot was available inside the window the caller allowed.
   Future<void> _acquireReaderSlot(int timeoutMs) async {
     if (_closing) {
       throw DbasSqliteException.dart(
@@ -2633,25 +3194,34 @@ class DbasSqlite {
       _readerSlotsAvailable--;
       return;
     }
+    if (timeoutMs <= 0) {
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.readerSlotWaitTimeout,
+        'Dart-side reader-slot acquire found no free slot and was given a '
+        'non-blocking budget (${timeoutMs}ms) — all pool readers are busy. '
+        'Close in-flight readers, or pass a positive timeout to wait for '
+        'one (DbasSqlite.kPoolAcquireTimeoutMs is the default).',
+      );
+    }
     final waiter = Completer<void>();
     _readerSlotWaitQueue.add(waiter);
-    Timer? timer;
-    if (timeoutMs > 0) {
-      timer = Timer(Duration(milliseconds: timeoutMs), () {
-        if (waiter.isCompleted) return;
-        _readerSlotWaitQueue.remove(waiter);
-        waiter.completeError(DbasSqliteException.dart(
-          DbasSqliteErrorCode.readerSlotWaitTimeout,
-          'Dart-side reader-slot wait timed out after ${timeoutMs}ms — '
-          'all pool readers are busy. Close in-flight readers or raise '
-          'DbasSqlite.kPoolAcquireTimeoutMs.',
-        ));
-      });
-    }
+    // Unconditional, and that is load-bearing rather than tidier: the
+    // non-blocking form never reaches here, so there is no longer any path
+    // on which a waiter joins this queue with nothing installed to fail it.
+    final timer = Timer(Duration(milliseconds: timeoutMs), () {
+      if (waiter.isCompleted) return;
+      _readerSlotWaitQueue.remove(waiter);
+      waiter.completeError(DbasSqliteException.dart(
+        DbasSqliteErrorCode.readerSlotWaitTimeout,
+        'Dart-side reader-slot wait timed out after ${timeoutMs}ms — '
+        'all pool readers are busy. Close in-flight readers or raise '
+        'DbasSqlite.kPoolAcquireTimeoutMs.',
+      ));
+    });
     try {
       await waiter.future;
     } finally {
-      timer?.cancel();
+      timer.cancel();
     }
   }
 
@@ -2762,6 +3332,16 @@ class DbasSqlite {
         .whenComplete(() => op.dispatch = null);
   }
 
+  /// How many times [_drainReentrantWriterOps] has reported that it is
+  /// still waiting. Test-only seam, mirroring
+  /// [DbasSqliteReader.debugStepDrainStallReports]: the stall report is a
+  /// fire-and-forget side effect with no other observable, and an
+  /// unbounded wait that stopped reporting would be silent again.
+  @visibleForTesting
+  int get debugReentrantWriterDrainStallReports =>
+      _reentrantWriterDrainStallReports;
+  int _reentrantWriterDrainStallReports = 0;
+
   /// Waits until no registered reentrant operation has a live dispatch
   /// chain left. Never throws — every tracked future is neutralised by
   /// [trackReentrantWriterOpDispatchInternal].
@@ -2772,15 +3352,83 @@ class DbasSqlite {
   /// the write that arrived last un-drained. Each tracked future clears
   /// itself from its operation once it settles, so the loop makes strict
   /// progress and ends as soon as the writer connection is quiescent.
+  ///
+  /// **The wait is deliberately unbounded, and it is upstream of every
+  /// bound this library advertises.** [closeDb] reaches it through
+  /// [rollback], BEFORE [_drainNativeOps] — so
+  /// [kNativeOpDrainTimeoutMs], the timeout a caller would expect to
+  /// surface a wedged teardown, never fires for anything waited on here.
+  /// Bounding it was considered and rejected: `.timeout()` does not
+  /// cancel the work, it ABANDONS it, and the detached [rollback] would
+  /// then still be free to issue a real `ROLLBACK` on the connection
+  /// after [_performClose] had moved on to its destructive dispatch —
+  /// a worse race than the hang, and the same one the post-drain
+  /// re-check exists to close.
+  ///
+  /// So it stays unbounded and stops being SILENT instead, exactly as
+  /// [DbasSqliteReader.close]'s step drain already does: every
+  /// [kReentrantWriterDrainStallReportMs] spent waiting reports how long
+  /// it has waited and for how many dispatches, through
+  /// [reportDiagnosticInternal] — `developer.log` alone is dropped
+  /// whenever no VM service client is subscribed, which is every release
+  /// build and every `flutter test` run, i.e. precisely where a
+  /// production hang happens.
   Future<void> _drainReentrantWriterOps() async {
-    while (true) {
-      final pending = <Future<void>>[
-        for (final op in _reentrantWriterOps.values)
-          if (op.dispatch != null) op.dispatch!,
-      ];
-      if (pending.isEmpty) return;
-      await Future.wait(pending);
+    // Armed lazily, on the first snapshot that actually has something to
+    // wait for: [rollback] calls this on every path and the common case
+    // returns without ever suspending, which is no reason to allocate a
+    // timer. Cancelled in the `finally` so it can never outlive the wait
+    // it describes.
+    Timer? reporter;
+    final waited = Stopwatch();
+    try {
+      while (true) {
+        final pending = <Future<void>>[
+          for (final op in _reentrantWriterOps.values)
+            if (op.dispatch != null) op.dispatch!,
+        ];
+        if (pending.isEmpty) return;
+        reporter ??= _startReentrantWriterDrainStallReporter(waited..start());
+        await Future.wait(pending);
+      }
+    } finally {
+      reporter?.cancel();
     }
+  }
+
+  /// The periodic stall report [_drainReentrantWriterOps] runs while it
+  /// waits — see there for why the wait is unbounded and why that makes
+  /// this mandatory rather than decorative. [waited] is already running.
+  Timer _startReentrantWriterDrainStallReporter(Stopwatch waited) {
+    final everyMs = debugReentrantWriterDrainStallReportMs ??
+        kReentrantWriterDrainStallReportMs;
+    return Timer.periodic(
+      Duration(milliseconds: everyMs < 1 ? 1 : everyMs),
+      (_) {
+        _reentrantWriterDrainStallReports++;
+        // Counted live rather than from the snapshot being awaited: a
+        // count that keeps changing means dispatches are churning and the
+        // drain is not converging, while a steady one means a single
+        // write never handed back. Same message, two different bugs.
+        final stillPending = _reentrantWriterOps.values
+            .where((op) => op.dispatch != null)
+            .length;
+        reportDiagnosticInternal(
+          'rollback: waited ${waited.elapsedMilliseconds}ms so far for '
+          '$stillPending in-transaction write dispatch(es) to hand back, '
+          'and is still waiting. The wait is UNBOUNDED by design and no '
+          'timeout covers it: closeDb() runs this drain BEFORE its '
+          'native-operation drain, so kNativeOpDrainTimeoutMs never fires '
+          'for it, and a .timeout() here would abandon the rollback rather '
+          'than cancel it — the detached ROLLBACK could then land on a '
+          'connection teardown had already moved on to destroying. A '
+          'dispatch that never hands back means an executeSql issued '
+          'inside this transaction and never awaited, on a worker that is '
+          'gone or wedged.',
+          name: 'dbas_sqlite.DbasSqlite',
+        );
+      },
+    );
   }
 
   // ── Native-operation registry ────────────────────────────────────────
@@ -2920,7 +3568,12 @@ class DbasSqlite {
   /// which is gated on `_isInTransaction` + `isOpened()` +
   /// `_assertNoInFlightWriterUsers()` and on nothing else. All three stay
   /// reachable in the window between [closeDb] latching [_closing] and
-  /// its `rollback()` clearing `_isInTransaction`. `executeReader`
+  /// `_isInTransaction` being cleared — and that window is **wider than
+  /// the first `rollback()`**, which is why [_performClose] re-checks the
+  /// flag after this drain rather than trusting it: [beginTransaction]
+  /// publishes the transaction only after its `BEGIN` round trip, i.e.
+  /// after the dispatch THIS drain waits for, so a straggler can open a
+  /// transaction while this method is parked. `executeReader`
   /// registers above its own gate too — synchronously at entry,
   /// deliberately above its routing branch — though the slot/lock gate
   /// rejects it immediately afterwards and its `finally` clears the
@@ -2935,6 +3588,16 @@ class DbasSqlite {
   /// clears itself from [_nativeOps] as it ends. What bounds the whole
   /// thing is [kNativeOpDrainTimeoutMs] ([debugNativeOpDrainTimeoutMs] in
   /// tests) — nothing else.
+  ///
+  /// **That bound covers THIS drain and nothing upstream of it.** The
+  /// `rollback()` [closeDb] runs first waits for every write dispatched
+  /// inside the transaction ([_drainReentrantWriterOps]) and that wait is
+  /// deliberately **unbounded** — see its docs for why bounding it would
+  /// abandon rather than cancel the rollback. A teardown wedged there
+  /// never reaches this method, so
+  /// [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout] cannot be what
+  /// surfaces it; the stall report at
+  /// [kReentrantWriterDrainStallReportMs] is.
   ///
   /// **On expiry it THROWS**
   /// [DbasSqliteErrorCode.closeDbNativeOpDrainTimeout], naming the
