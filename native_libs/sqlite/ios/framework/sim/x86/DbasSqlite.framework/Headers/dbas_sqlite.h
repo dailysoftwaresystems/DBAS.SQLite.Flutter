@@ -393,11 +393,23 @@ extern "C" {
          * the lock / condvar. */
         bool closing;
         /* Count of in-flight pool operations that must finish before
-         * teardown is safe: parked blocking-acquires (so the condvar
-         * isn't destroyed under them) AND checked-out readers (so a
-         * reader isn't force-closed while a caller still holds it). A
-         * successful acquire keeps its bump until `PoolReleaseReader`.
-         * `ClosePool` waits for this to reach zero. */
+         * teardown is safe. Two contributors, both tracked under the
+         * lock:
+         *   1. A blocking acquire parked in `pool_cond_wait` /
+         *      `pool_cond_timedwait_ms` — bumped on entry so `ClosePool`
+         *      can't destroy the condvar it's blocked on.
+         *   2. A CHECKED-OUT reader — the bump from a successful
+         *      acquire is NOT released on return; it persists for the
+         *      whole acquire→`PoolReleaseReader` interval so `ClosePool`
+         *      can't `closeDbCore` a reader (or destroy the lock that
+         *      `PoolReleaseReader` will take) while a caller still holds
+         *      and may be stepping it.
+         * For a blocking acquire the single entry-bump serves both
+         * phases with no gap: it covers the park, then transfers to
+         * covering the held reader on success. Decremented (and the
+         * condvar broadcast) on every acquire-failure path and inside
+         * `PoolReleaseReader`, so a draining `ClosePool` observes zero
+         * once every reader is back and every waiter has bailed. */
         int activeOps;
 #ifndef __EMSCRIPTEN__
 #ifdef _WIN32
@@ -408,7 +420,7 @@ extern "C" {
          * waits on this to avoid the spin-and-retry pattern FFI
          * consumers would otherwise have to write at the Dart /
          * language layer; `ClosePool` waits on it to drain in-flight
-         * acquires and checked-out readers before tearing the pool down. */
+         * acquires before tearing the pool down. */
         CONDITION_VARIABLE readerAvailable;
 #else
         pthread_mutex_t lock;

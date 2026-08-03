@@ -1,0 +1,9 @@
+# Written by scripts/sqlite/sync_sqlite_lib.{sh,ps1} - do not edit.
+# Describes ONLY the directories named in legs=; anything else under
+# this tree predates the sync and is not refreshed by it.
+tag=v4.7.2
+sha=48770088b50d7bcb102cddf7c2ca17d546418ed2
+ref=refs/heads/release/stable
+run=30819540349
+attempt=1
+legs=android,apple,linux,web,windows
