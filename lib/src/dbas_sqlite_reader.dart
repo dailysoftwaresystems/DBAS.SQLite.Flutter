@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:dbas_sqlite/src/dbas_sqlite.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_column_type.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_db.dart'
     if (dart.library.js_interop) 'package:dbas_sqlite/src/stub/dbas_sqlite_db_stub.dart';
@@ -7,6 +9,34 @@ import 'package:dbas_sqlite/src/dbas_sqlite_platform.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_row_cache.dart';
 import 'package:dbas_sqlite/src/exceptions/dbas_sqlite_exception.dart';
 import 'package:decimal/decimal.dart';
+// `show`n rather than imported wholesale: a bare foundation import makes
+// this file's `dart:typed_data` (Uint8List, for getColumnBlob) redundant.
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
+/// Why a [DbasSqliteReader] was closed, as far as the reader itself can
+/// actually know it.
+///
+/// Exists so [DbasSqliteErrorCode.readerClosedDuringScan] can describe
+/// the cause instead of asserting one. A reader records *that* it was
+/// closed; before this it also told every caller *who* had closed it
+/// ("something tore it down mid-scan"), which sends a consumer who
+/// deliberately closed after a partial scan hunting for a `closeDb()`
+/// that never happened.
+enum _ReaderCloseReason {
+  /// Someone called [DbasSqliteReader.close] or
+  /// [DbasSqliteStatement.close] directly. The commonest case, and the
+  /// one the old message described worst.
+  explicit,
+
+  /// `closeDb`'s statement sweep — the only route that genuinely is a
+  /// teardown, and the only one allowed to say so.
+  teardown,
+
+  /// `readRow` closed the reader itself after a step failed. The caller
+  /// already received that failure; this only explains the state a later
+  /// call finds.
+  stepFailed,
+}
 
 /// An independent reader for a single prepared SELECT statement.
 ///
@@ -29,6 +59,60 @@ import 'package:decimal/decimal.dart';
 /// await reader.close();
 /// ```
 class DbasSqliteReader {
+  /// Test-only rendezvous inside [readRow]'s step window — after the
+  /// native step has been dispatched against this reader's live
+  /// `sqlite3_stmt` and before [readRow] consumes its result. `null` in
+  /// production; the awaited call is the only cost when it is set.
+  ///
+  /// Exists because that window is the one stretch of a reader's life no
+  /// other seam can observe. `DbasSqliteStatement.debugBeforeReaderTransfer`
+  /// stops one instruction too early — there is no reader yet — and once
+  /// there is one, nothing this class exposes moves while a step is out:
+  /// [isClosed] is still `false`, the row cache still holds the previous
+  /// row, and the parent statement's `_activeReader` has pointed here
+  /// since `executeReader` returned.
+  ///
+  /// Awaited as part of the step future itself rather than beside it (see
+  /// [_stepAndCache]), so whatever a caller tracks as "this reader has a
+  /// step outstanding" stays outstanding for exactly as long as the hook
+  /// parks. A hook that ran alongside the dispatch instead would let the
+  /// dispatch settle underneath it and observe nothing.
+  ///
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static, so
+  /// a leaked hook would park the first row of every later test.
+  ///
+  /// **Never await a close of this reader from inside the hook** — a
+  /// `db.closeDb()`, a `stmt.close()` or a `reader.close()`. The hook is
+  /// part of the step future, [close] drains that future before it lets
+  /// `onClose` finalize anything, and `closeDb`'s statement sweep runs
+  /// through [close]: the hook would be waiting on a close that is
+  /// waiting on the hook. That wait is unbounded by design (see
+  /// [close]), so the deadlock produces no error at all — only the
+  /// periodic stall report [close] logs. Start the close from the test
+  /// body and let the hook do nothing but park, as the reader-teardown
+  /// cases do.
+  @visibleForTesting
+  static Future<void> Function()? debugInsideReadRowStep;
+
+  /// How long [close] waits for an in-flight step before it starts
+  /// logging that it is still waiting, and the interval it repeats at.
+  ///
+  /// It does **not** bound the wait — see [close] for why the wait
+  /// itself must stay unbounded. It exists so that "unbounded" does not
+  /// also mean "silent": a teardown wedged behind a step that never
+  /// hands back is otherwise indistinguishable from a slow one. Wire
+  /// [DbasSqlite.onDiagnostic] to actually receive the report; the
+  /// `dart:developer` copy reaches nobody in a release build or under
+  /// `flutter test`.
+  static const int kStepDrainStallReportMs = 5000;
+
+  /// Test-only override for [kStepDrainStallReportMs], so the stall
+  /// report can be exercised in milliseconds. Static, like the other
+  /// debug seams here — reset it in a `finally` / `addTearDown`. Values
+  /// below 1 ms are clamped to 1 ms.
+  @visibleForTesting
+  static int? debugStepDrainStallReportMs;
+
   final DbasSqliteDb _conn;
   final int _handle;
   final DbasSqlitePlatform _platform;
@@ -37,6 +121,63 @@ class DbasSqliteReader {
 
   bool _closed = false;
   Future<void>? _closeFuture;
+
+  /// Why this reader closed — see [_ReaderCloseReason]. Meaningful only
+  /// once [_closed] is `true`; the initial value is never read.
+  _ReaderCloseReason _closeReason = _ReaderCloseReason.explicit;
+
+  /// Every step [readRow] currently has dispatched against [_handle].
+  /// **This reader's only signal that native code is touching its
+  /// `sqlite3_stmt` right now**, and what [_doClose] drains before it
+  /// lets `onClose` finalize that handle.
+  ///
+  /// **A set, not a single slot, because N steps can be outstanding at
+  /// once.** Nothing rejects two un-awaited [readRow] calls on one
+  /// reader, and a single slot would be *overwritten* by the second:
+  /// the first step would still be inside `sqlite3_step` with nothing
+  /// referencing it, so a [close] arriving in between would drain only
+  /// the second and finalize the handle under the first — the exact
+  /// `FinalizeStmt`-under-`sqlite3_step` corruption this drain exists to
+  /// prevent, reached through the drain. `_dispatch` picks the
+  /// least-loaded worker with no per-handle affinity, so two steps do
+  /// not even share an OS thread and can settle in either order.
+  ///
+  /// Concurrent [readRow] on one reader is not a *useful* shape — the
+  /// two calls race [_rowCache], so each may read the other's row — but
+  /// nothing rejects it, so "not useful" must not be allowed to mean
+  /// "corrupts memory".
+  ///
+  /// Nothing else in the wrapper can stand in for this. `readRow`
+  /// registers nothing with [DbasSqlite]'s native-operation registry
+  /// (see `_drainNativeOps`), so from teardown's point of view a reader
+  /// parked mid-step looks exactly like an idle one: [isClosed] is
+  /// `false`, the row cache still holds the previous row, and the parent
+  /// statement's `_activeReader` has pointed here since `executeReader`
+  /// returned.
+  final Set<Future<int>> _inFlightSteps = <Future<int>>{};
+
+  /// How many steps are currently published in [_inFlightSteps].
+  /// Test-only seam, and the only NON-DESTRUCTIVE witness there is for
+  /// "this step reached the set before anything could observe it": the
+  /// alternative — starting a close from inside the step window and
+  /// seeing whether it waits — is the corruption under test, and a
+  /// SIGSEGV kills the runner instead of failing an assertion.
+  @visibleForTesting
+  int get debugInFlightStepCount => _inFlightSteps.length;
+
+  /// How many times [close] has reported that it is still waiting for an
+  /// in-flight step. Test-only seam: the stall report is a fire-and-
+  /// forget side effect with no other observable, and an unbounded wait
+  /// that stopped reporting would be silent again.
+  @visibleForTesting
+  int get debugStepDrainStallReports => _stepDrainStallReports;
+  int _stepDrainStallReports = 0;
+
+  /// `true` once a step returned `SQLITE_DONE` — the result set genuinely
+  /// ran out. The **only** state in which a [readRow] on a closed reader
+  /// may answer `false`; see [readRow] for why every other closed state
+  /// throws instead.
+  bool _exhausted = false;
 
   /// Internal constructor used by [DbasSqliteStatement.executeReader].
   /// Consumers should not call this directly.
@@ -58,6 +199,16 @@ class DbasSqliteReader {
   }
 
   /// Whether this reader has been closed.
+  ///
+  /// Latches the INSTANT a close starts, before anything has been waited
+  /// for. Correct for "may I still use this reader?" — every consumer
+  /// entry point must refuse from that moment — but **not** for "is
+  /// native code done with this reader?". Nothing on this class answers
+  /// that second question, deliberately: an `isFullyClosedInternal` flag
+  /// set at the end of [_doClose] used to, and it was inert by
+  /// construction — see [DbasSqliteStatement.hasOpenWriterReaderInternal],
+  /// which is the only predicate that ever needed the distinction and
+  /// which gets it from the statement's own slot instead.
   bool get isClosed => _closed;
 
   /// Advances to the next row of the current result set.
@@ -72,13 +223,60 @@ class DbasSqliteReader {
   /// [DbasSqliteException.sqliteCode] and — when the platform resolved
   /// one — the extended rc on [DbasSqliteException.sqliteUniqueCode]
   /// (e.g. 2067 for `SQLITE_CONSTRAINT_UNIQUE`).
+  ///
+  /// **`false` means "no more rows", and nothing else.** Calling this on
+  /// a reader that was closed for any other reason — an explicit
+  /// [close], [DbasSqliteStatement.close], or `closeDb`'s statement
+  /// sweep during teardown — throws
+  /// [DbasSqliteErrorCode.readerClosedDuringScan] instead. Answering
+  /// `false` there would make a scan cut short by teardown
+  /// indistinguishable from one that ran out of rows, and the consumer
+  /// shape this protects (a `while (await readRow())` loop building a
+  /// list) would hand back a silently truncated result with no error of
+  /// any kind. See [close] for what a mid-scan consumer observes.
   Future<bool> readRow() async {
-    if (_closed) return false;
+    if (_closed) {
+      if (_exhausted) return false;
+      throw DbasSqliteException.dart(
+        DbasSqliteErrorCode.readerClosedDuringScan,
+        'This reader was closed before its result set was exhausted, so '
+        'the scan is TRUNCATED rather than finished. ${_closedByDetail()} '
+        'Returning false would be indistinguishable from a genuine end of '
+        'rows and would silently drop the remaining rows, so the '
+        'truncation is raised instead. Stop iterating: the statement '
+        'behind this reader has already been finalized.',
+      );
+    }
 
-    final readResult = await _platform.readRowAndCache(_conn, _handle, _rowCache);
+    // Publish the step BEFORE suspending on it: [_doClose] reads
+    // [_inFlightSteps] to decide whether native code is still touching
+    // [_handle], and a step that only becomes visible after the first
+    // `await` is a step teardown can walk past. [_stepAndCache] does the
+    // publishing itself, in the same expression as the dispatch, so the
+    // two cannot come apart.
+    final step = _stepAndCache();
+    final int readResult;
+    try {
+      readResult = await step;
+    } finally {
+      // Clear only OUR registration. A concurrent un-awaited readRow has
+      // its own entry, and that one must stay visible to [_doClose].
+      _inFlightSteps.remove(step);
+    }
+
     if (!_isSuccessRc(readResult)) {
+      // Every connection-scoped read happens HERE, before `close()`
+      // hands the pool connection back through `releaseFn`. After that
+      // release `_conn` may already be serving another reader's
+      // statement, so a later `getErrorCode` would describe someone
+      // else's failure — and both are SYNCHRONOUS main-isolate FFI while
+      // `finalizeStmt` / `closePool` run on worker isolates, which makes
+      // a read after the release a use-after-free in a teardown race
+      // rather than merely a stale number.
       String? error = _platform.getLastStmtError(_conn, _handle);
-      await close();
+      final errorCode = _platform.getErrorCode(_conn) ?? readResult;
+      final uniqueErrorCode = _platform.getUniqueErrorCode(_conn);
+      await _close(_ReaderCloseReason.stepFailed);
       if (error == null && readResult == sqliteMisuse) {
         error = 'Misuse: possibly missing or invalid bind.';
       }
@@ -86,13 +284,18 @@ class DbasSqliteReader {
       throw DbasSqliteException.sqlite(
         DbasSqliteErrorCode.readRowFailed,
         'It was not possible to run the query ($readResult): $error',
-        sqliteCode: _platform.getErrorCode(_conn) ?? readResult,
-        sqliteUniqueCode: _platform.getUniqueErrorCode(_conn),
+        sqliteCode: errorCode,
+        sqliteUniqueCode: uniqueErrorCode,
       );
     }
 
     final hasRow = readResult == sqliteRow;
-    if (!hasRow) await close();
+    if (!hasRow) {
+      // Set BEFORE the close, so the closed reader is already tagged
+      // "ran out of rows" by the time anything can observe it closed.
+      _exhausted = true;
+      await close();
+    }
     return hasRow;
   }
 
@@ -110,6 +313,17 @@ class DbasSqliteReader {
   ///
   /// Returns an empty list with `hasMore: false` immediately when
   /// [amount] is non-positive.
+  ///
+  /// This is the library's own [readRow] loop, so it inherits both of
+  /// that method's teardown properties rather than restating them: a
+  /// [close] arriving mid-batch waits for the dispatched step (see
+  /// [close]), and a reader torn down mid-batch makes the next
+  /// [readRow] throw [DbasSqliteErrorCode.readerClosedDuringScan].
+  /// **That throw propagates and the rows gathered so far are
+  /// discarded** — deliberately, and for the reason [readRow] documents:
+  /// returning them with `hasMore: false` would report a truncated batch
+  /// as a completed one, and returning them with `hasMore: true` would
+  /// invite a follow-up call on a finalized statement.
   Future<({List<Map<String, ColumnData>> rows, bool hasMore})> readRows(
       [int amount = 50]) async {
     final rows = <Map<String, ColumnData>>[];
@@ -119,7 +333,21 @@ class DbasSqliteReader {
       hasMore = await readRow();
       if (!hasMore) break;
       final cols = _rowCache.columns;
-      if (cols == null) continue;
+      if (cols == null) {
+        // Raised, never skipped. `readRow()` answered `true`, so a row
+        // exists; `continue`ing past it would drop that row and return
+        // the list SHORT — the exact silent truncation this method's
+        // contract promises cannot happen. No producer currently emits
+        // `SQLITE_ROW` with a null column set, which is what makes this
+        // defensive rather than reachable, but a defence that silently
+        // loses a row is worse than none.
+        throw DbasSqliteException.dart(
+          DbasSqliteErrorCode.readRowFailed,
+          'readRows: the step reported a row but the row cache holds no '
+          'columns, so the row cannot be snapshotted. Returning the batch '
+          'without it would silently drop a row that SQLite produced.',
+        );
+      }
       final row = <String, ColumnData>{};
       for (int c = 0; c < cols.length; c++) {
         row[getColumnName(c)] = cols[c];
@@ -127,6 +355,91 @@ class DbasSqliteReader {
       rows.add(row);
     }
     return (rows: rows, hasMore: hasMore);
+  }
+
+  /// Dispatches one native step, registers it in [_inFlightSteps], and
+  /// lets the platform populate [_rowCache] from its reply.
+  ///
+  /// Split out of [readRow] for two reasons. The future it returns — one
+  /// of this reader's signals that a step is outstanding against
+  /// [_handle] — spans [debugInsideReadRowStep] as well as the dispatch;
+  /// and the dispatch and its registration happen in one expression with
+  /// no `await` between them, so nothing can run in that gap and there is
+  /// no path on which a step reaches native code without reaching
+  /// [_inFlightSteps]. Such a step would be dispatched against a live
+  /// handle, referenced by nothing and drained by nothing. ([_stepThroughHook]
+  /// yields before it calls the hook for exactly this reason — see there.)
+  ///
+  /// Not `async`, so the production path (hook `null`) returns the
+  /// platform future itself and adds no frame or microtask per row.
+  Future<int> _stepAndCache() {
+    final step = _platform.readRowAndCache(_conn, _handle, _rowCache);
+    // Test-only rendezvous — see [debugInsideReadRowStep].
+    final insideStep = debugInsideReadRowStep;
+    if (insideStep == null) return _publishStep(step);
+    return _publishStep(_stepThroughHook(step, insideStep));
+  }
+
+  /// Records [step] as outstanding against [_handle] and returns it
+  /// unchanged.
+  Future<int> _publishStep(Future<int> step) {
+    _inFlightSteps.add(step);
+    return step;
+  }
+
+  /// [debugInsideReadRowStep] composed **into** [step] rather than run
+  /// beside it, so "this reader has a step outstanding" stays true for
+  /// exactly as long as the hook parks. A hook running alongside the
+  /// dispatch would let the dispatch settle underneath it and observe
+  /// nothing.
+  ///
+  /// The hook is invoked in here rather than by [_stepAndCache] so that
+  /// a hook throwing **synchronously** becomes this future's error
+  /// instead of an exception escaping [_stepAndCache] before
+  /// [_publishStep] runs — which would leave [step] dispatched against a
+  /// live handle and tracked by nothing. The step is awaited on the
+  /// failure path too, for the same reason: it is already out, and the
+  /// hook failing does not recall it.
+  ///
+  /// Test-path only. Production never reaches this frame.
+  Future<int> _stepThroughHook(
+      Future<int> step, Future<void> Function() hook) async {
+    // Yield BEFORE calling the hook. An `async` body runs synchronously
+    // up to its first `await`, so without this the hook would run before
+    // [_publishStep] had added this future to [_inFlightSteps] — and a
+    // hook that synchronously starts a close would find an empty set and
+    // finalize the statement under a live step. The docs forbid that
+    // shape, but "there is no path on which a step reaches native code
+    // without reaching [_inFlightSteps]" has to be true of this path too.
+    await Future<void>.value();
+    try {
+      await hook();
+    } catch (_) {
+      await step.then<void>((_) {}, onError: (Object _) {});
+      rethrow;
+    }
+    return step;
+  }
+
+  /// The cause clause of [DbasSqliteErrorCode.readerClosedDuringScan],
+  /// branched on what actually closed this reader rather than listing
+  /// every way it might have been closed and letting the reader guess.
+  String _closedByDetail() {
+    switch (_closeReason) {
+      case _ReaderCloseReason.explicit:
+        return 'It was closed by an explicit close() — either '
+            'reader.close() or DbasSqliteStatement.close(). If that was '
+            'deliberate, stop iterating after the close instead of '
+            'probing the reader again; if it was not, the close is the '
+            'bug, not this call.';
+      case _ReaderCloseReason.teardown:
+        return "It was torn down by closeDb()'s statement sweep, i.e. the "
+            'database was closed while this scan was still running.';
+      case _ReaderCloseReason.stepFailed:
+        return 'An earlier readRow() failed and closed the reader as part '
+            'of reporting that failure — see the readRowFailed exception '
+            'that call threw for the underlying cause.';
+    }
   }
 
   // sqlite3_step never returns SQLITE_OK per the C contract; the
@@ -309,13 +622,139 @@ class DbasSqliteReader {
   ///
   /// The `_closed = true` flag is set synchronously before the first
   /// `await` so the active-reader guard on the parent statement
-  /// observes the closing state immediately.
-  Future<void> close() {
-    return _closeFuture ??= _doClose();
+  /// observes the closing state immediately — and, since this release,
+  /// so that no NEW step can be dispatched once teardown has begun,
+  /// which is what makes the drain below terminate.
+  ///
+  /// **Waits for every in-flight [readRow] step before running
+  /// `onClose`.** `onClose` finalizes this reader's `sqlite3_stmt`, and a
+  /// step that is still dispatched is native code holding that exact
+  /// handle on a different worker thread — `_dispatch` picks the
+  /// least-loaded worker, so the step and the finalize genuinely do not
+  /// share one. Neither side interlocks in C: `FinalizeStmt` has no busy
+  /// check and no refcount, and `ReadRow` resolves the pointer, drops
+  /// `db_stmts_lock`, then steps and writes through it unlocked.
+  /// Serialising here covers every route by construction — an explicit
+  /// [close], [DbasSqliteStatement.close], `executeScalar`'s `finally`,
+  /// and `closeDb`'s statement sweep all funnel through this one method
+  /// — and every step, since [_inFlightSteps] is a set rather than a
+  /// single slot (see it for why that matters).
+  ///
+  /// The wait is deliberately **unbounded**. A timeout could only expire
+  /// into finalizing the handle anyway (the corruption this exists to
+  /// prevent), and throwing instead would leave `onClose` unrun — the
+  /// statement never finalized and the pool reader never released, which
+  /// wedges `ClosePool` just as hard with less information. What is
+  /// waited for is already-dispatched `sqlite3_step`s, not a consumer
+  /// -driven scan: they cannot fail to arrive unless the worker isolate
+  /// is gone, in which case nothing is recoverable.
+  ///
+  /// Unbounded is not the same as silent, and this is the one wait in
+  /// the library that no timeout will ever surface: every
+  /// [kStepDrainStallReportMs] spent waiting reports how long it has
+  /// waited and for how many steps, so a wedged teardown can be diagnosed
+  /// from a log instead of inferred from a hang. That report goes to
+  /// [DbasSqlite.onDiagnostic] **as well as** `dart:developer` —
+  /// `developer.log` alone is discarded whenever no VM service client is
+  /// subscribed, which is every release build on a device and every
+  /// `flutter test` run, i.e. precisely where a production hang happens.
+  /// Note that `closeDb`'s advertised `kNativeOpDrainTimeoutMs` bound
+  /// does **not** cover this wait: the registry drain it bounds runs
+  /// earlier, and this one sits downstream of it inside the statement
+  /// sweep.
+  ///
+  /// **Consumer-visible consequence, intended:** a consumer suspended in
+  /// `readRow()` when this runs still receives the row its step already
+  /// produced — it was read before anything was torn down and the cache
+  /// is pure Dart — and its NEXT `readRow()` throws
+  /// [DbasSqliteErrorCode.readerClosedDuringScan]. A `while (await
+  /// readRow())` loop therefore ends in an error rather than in a
+  /// silently short list.
+  Future<void> close() => _close(_ReaderCloseReason.explicit);
+
+  /// [close] for `closeDb`'s statement sweep, which is the one caller
+  /// that may truthfully describe itself as teardown. Everything else it
+  /// does is identical — including the join-idempotency, so a sweep
+  /// arriving on a reader whose consumer already started closing it joins
+  /// that close and leaves its reason (and its message) alone.
+  Future<void> closeForTeardownInternal() =>
+      _close(_ReaderCloseReason.teardown);
+
+  Future<void> _close(_ReaderCloseReason reason) =>
+      _closeFuture ??= _doClose(reason);
+
+  Future<void> _doClose(_ReaderCloseReason reason) async {
+    // Recorded before the latch below, so a reader is never observable
+    // as closed without also carrying why. [_closeFuture] means the FIRST
+    // caller's reason is the one kept, which is the honest one: it is the
+    // close that actually tore the reader down.
+    _closeReason = reason;
+    // Synchronous, and first — and that makes ONE pass enough.
+    //
+    // [readRow]'s guard and its publish sit in a single uninterrupted
+    // stretch: there is no `await` between `if (_closed)` and the
+    // `_stepAndCache()` below it, and `_stepAndCache` publishes before
+    // it returns. So latching here, before this method's first
+    // suspension, means no further step can ever be published against
+    // [_handle] — every readRow that had already dispatched one is in
+    // the set, and every readRow that had not yet will now throw at the
+    // guard. The snapshot taken below is therefore COMPLETE, which is
+    // why this drains once instead of looping. (Put an `await` between
+    // that guard and that publish and this reasoning stops holding —
+    // the snapshot would no longer be complete and this would have to
+    // become a loop.)
+    _closed = true;
+    if (_inFlightSteps.isNotEmpty) {
+      final steps = List.of(_inFlightSteps);
+      _inFlightSteps.clear();
+      await _awaitSteps(steps);
+    }
+    await _onClose();
   }
 
-  Future<void> _doClose() async {
-    _closed = true;
-    await _onClose();
+  /// Waits for every step in [steps] to hand back, logging a stall
+  /// report every [kStepDrainStallReportMs] rather than ever giving up
+  /// on one — see [close] for why the wait must stay unbounded and why
+  /// it must not therefore be silent.
+  ///
+  /// Results and failures belong to the [readRow] calls that dispatched
+  /// these steps; all this needs to know is that native code is done
+  /// with [_handle]. Swallowing the errors here also keeps a failed step
+  /// from surfacing as an unhandled asynchronous error on this path.
+  Future<void> _awaitSteps(List<Future<int>> steps) async {
+    final waited = Stopwatch()..start();
+    final everyMs = debugStepDrainStallReportMs ?? kStepDrainStallReportMs;
+    final reporter = Timer.periodic(
+      Duration(milliseconds: everyMs < 1 ? 1 : everyMs),
+      (_) {
+        _stepDrainStallReports++;
+        // Through [DbasSqlite.reportDiagnosticInternal], not `developer
+        // .log` alone: this is the only report a wedged teardown ever
+        // produces, and `developer.log` is dropped whenever no VM service
+        // client is subscribed — which is every release build on a device
+        // and every `flutter test` run. See [DbasSqlite.onDiagnostic].
+        DbasSqlite.reportDiagnosticInternal(
+          'reader close: waited ${waited.elapsedMilliseconds}ms so far for '
+          '${steps.length} in-flight readRow step(s) on statement $_handle, '
+          'and is still waiting. The wait is UNBOUNDED by design — expiring '
+          'it could only expire into finalizing a statement a step is using, '
+          'which is the corruption it exists to prevent — so this repeats '
+          'until the step(s) hand back. A step that never hands back means '
+          'the worker isolate serving it is gone or wedged, or something '
+          'inside the step window is itself waiting on this close (a '
+          'debugInsideReadRowStep hook that awaits closeDb does exactly '
+          'that).',
+          name: 'dbas_sqlite.DbasSqliteReader',
+        );
+      },
+    );
+    try {
+      await Future.wait([
+        for (final step in steps)
+          step.then<void>((_) {}, onError: (Object _) {}),
+      ]);
+    } finally {
+      reporter.cancel();
+    }
   }
 }

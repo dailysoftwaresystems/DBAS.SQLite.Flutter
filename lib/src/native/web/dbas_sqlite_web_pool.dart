@@ -725,7 +725,23 @@ class DbasSqliteWebPool {
   /// successful `SQLITE_DONE` step or after a bind failure.
   Future<void> finalizeStmt(JSAny rawHandle) {
     if (_closed) {
-      // Worker is gone; the handle is implicitly finalized.
+      // Join an in-flight close instead of claiming the worker is
+      // already gone. `_closed` latches at the TOP of [close], before
+      // the graceful worker close and `terminate()` it awaits, so the
+      // old unconditional `Future.value()` was answering "implicitly
+      // finalized" while the worker was still alive with the statement
+      // still open — a close that has STARTED reported as one that has
+      // FINISHED. Waiting on [_closing] (the same barrier [close]'s own
+      // duplicate-caller path awaits, for the same reason) makes the
+      // answer true when it is given: the barrier completes only after
+      // the worker confirmed its OPFS drain and every pending request
+      // was settled, so the handle really is reclaimed by then.
+      //
+      // Null barrier means no close is in flight for this dbName — the
+      // close finished, the worker is gone, and the original immediate
+      // return is correct.
+      final closing = _closing[dbName];
+      if (closing != null) return closing;
       return Future.value();
     }
     final id = _nextId++;

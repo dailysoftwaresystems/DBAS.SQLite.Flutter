@@ -5,6 +5,7 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart' show protected;
 import 'package:path/path.dart' as path;
 import 'dbas_sqlite_native_interface.dart';
+import 'package:dbas_sqlite/src/dbas_sqlite.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_db.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_row_cache.dart';
 import 'package:dbas_sqlite/src/helpers/dbas_sqlite_platform_util.dart';
@@ -205,24 +206,158 @@ abstract class DbasSqliteNativeAppBase extends DbasSqliteNativeInterface {
     return await dbFile.exists();
   }
 
+  /// Scratch path an attach writes to before swapping it onto
+  /// [fileName]. A **sibling** of the real path, and that is
+  /// load-bearing: `rename` is atomic only within one filesystem, and a
+  /// temp on another volume (a system temp directory, say) would silently
+  /// degrade into a copy — reopening exactly the window the temp exists
+  /// to close. Deriving it by appending to the resolved database path is
+  /// what makes "same directory" true by construction rather than by
+  /// assumption.
+  ///
+  /// Deliberately NOT one of the suffixes [dropDb] deletes. [dropDb] runs
+  /// *between* the write and the rename, so a drop that also swept this
+  /// path would delete the freshly-written replacement one line before it
+  /// is swapped in.
+  String _attachTempPath(String fileName) => '$fileName.attach.tmp';
+
+  /// Replaces [fileName]'s database with [content].
+  ///
+  /// **Writes a sibling temp, then swaps.** The eager variant of the same
+  /// atomicity contract [attachStreamDb] documents at length: the real
+  /// path is either the database that was there before or the database
+  /// the caller supplied, never a fragment of the second one. Its window
+  /// was much smaller than the streaming variant's — `writeAsBytes` on an
+  /// in-memory buffer, not a download — but not zero, and not
+  /// zero-consequence: `writeAsBytes` opens for writing (truncating)
+  /// before copying, so a write that dies partway used to leave a
+  /// truncated file where the previous database had been.
+  ///
+  /// `flush: true` is load-bearing here, not tidiness. Publishing a file
+  /// by renaming it means the rename must not be able to complete over
+  /// bytes the OS is still holding — otherwise a crash immediately after
+  /// the swap leaves a correctly-named, incompletely-written database,
+  /// which is the same class of harm one layer down.
   @override
   Future attachDb(String fileName, List<int> content) async {
-    await dropDb(fileName);
-    final dbFile = File(fileName);
-    await dbFile.writeAsBytes(content);
+    final tmpFile = File(_attachTempPath(fileName));
+    try {
+      await tmpFile.writeAsBytes(content, flush: true);
+      await dropDb(fileName);
+      await tmpFile.rename(fileName);
+    } finally {
+      await _deleteAttachTemp(tmpFile);
+    }
   }
 
+  /// Removes an attach's scratch file without ever replacing the failure
+  /// that brought teardown here.
+  ///
+  /// **The guard is load-bearing, and the argument that it was not is
+  /// wrong past one specific line.** "A cleanup failure is acceptable
+  /// because the DATABASE is intact — what is lost is only the
+  /// description of why the attach failed" holds while the temp is being
+  /// written, and stops holding the moment [dropDb] has run: [dropDb]
+  /// attempts all four deletions and reports the ones that failed, so the
+  /// destination can be HALF-DELETED — a `.db` gone with a `-wal` left
+  /// behind is a corrupt-looking next open, not an intact database. And
+  /// the two failures correlate: on Windows the thing that makes a
+  /// delete of the live path throw (a lock over that directory, or a
+  /// handle the OS has not released yet) is exactly what makes this
+  /// delete throw too. Unguarded, the error that survives names
+  /// `.attach.tmp` and says nothing at all about the `-wal` that could
+  /// not be removed from the real path.
+  ///
+  /// Reported rather than swallowed: a stranded scratch file is debris
+  /// the next attach truncates, so it costs nothing but it is also
+  /// nobody's recovery artifact and no consumer knows to look for one.
+  /// [DbasSqlite.reportDiagnosticInternal] is what a consumer can
+  /// actually read — `developer.log` is dropped whenever no VM service
+  /// client is subscribed.
+  Future<void> _deleteAttachTemp(File tmpFile) async {
+    try {
+      if (await tmpFile.exists()) await tmpFile.delete();
+    } catch (e, st) {
+      developer.log(
+        'attach: deleting the scratch file "${tmpFile.path}" failed',
+        name: 'dbas_sqlite.DbasSqliteNativeAppBase',
+        error: e,
+        stackTrace: st,
+      );
+      DbasSqlite.reportDiagnosticInternal(
+        'attach: deleting the scratch file "${tmpFile.path}" failed ($e). '
+        'It is debris the next attach truncates, so nothing depends on it '
+        'being gone. This is reported and NOT raised because raising it '
+        'would replace whatever failure brought the attach here — and '
+        'when that failure came from dropDb the destination may be '
+        'half-deleted, which is the part worth reading.',
+        name: 'dbas_sqlite.DbasSqliteNativeAppBase',
+      );
+    }
+  }
+
+  /// Replaces [fileName]'s database with the bytes arriving on [stream].
+  ///
+  /// **Writes a sibling temp, flushes it, closes it, and only then drops
+  /// the destination and renames the temp onto it.** The order is the
+  /// whole point. Deleting first and writing to the real path afterwards
+  /// meant that from [dropDb] until the last chunk landed there was no
+  /// database at [fileName] — only an absence, and then a fragment — and
+  /// the length of that window is the CALLER's to decide, not this
+  /// library's: [stream] is caller-supplied, and where it is network-fed
+  /// the window is the whole download. A source that failed partway
+  /// therefore destroyed the database it was replacing and left a
+  /// truncated file in its place, with nothing left to retry against.
+  ///
+  /// Now a failed attach is a no-op: the real path is untouched until a
+  /// complete replacement exists beside it, and the `finally` removes the
+  /// scratch file on every path. `openWrite()` truncates, so a temp
+  /// stranded by a killed process is reused rather than appended to.
+  ///
+  /// **Its sibling [streamCopyDb] is not the same code despite looking
+  /// like it.** That method also deletes its destination first, and may:
+  /// its SOURCE is a local file already settled by a checkpoint before
+  /// any deletion happens, so there is no window in which the outcome
+  /// depends on something that can still fail. The asymmetry is in the
+  /// source, not in the deletion order.
+  ///
+  /// **Residual, stated rather than papered over.** Between [dropDb]
+  /// returning and `rename` completing the old database is gone and the
+  /// new one is not yet in place. Nothing that can take time happens
+  /// there — the payload is already written and fsynced — so the window
+  /// is a single metadata operation rather than a transfer, but it is not
+  /// nothing. Closing it entirely needs a rename that is also a delete of
+  /// the four SQLite side files, which no filesystem offers as one
+  /// operation.
+  ///
+  /// A rejected alternative: keeping the destination in place and writing
+  /// through it, restoring the previous bytes on failure. That needs the
+  /// whole previous database held somewhere for the duration — which is
+  /// the temp file again, only now on the failure path where it is least
+  /// affordable — and it still cannot survive the process dying mid-restore.
   @override
   Future attachStreamDb(String fileName, Stream<List<int>> stream) async {
-    await dropDb(fileName);
-    final sink = File(fileName).openWrite();
+    final tmpFile = File(_attachTempPath(fileName));
     try {
-      await for (final chunk in stream) {
-        sink.add(chunk);
+      final sink = tmpFile.openWrite();
+      try {
+        await for (final chunk in stream) {
+          sink.add(chunk);
+        }
+        await sink.flush();
+      } finally {
+        await sink.close();
       }
-      await sink.flush();
+      await dropDb(fileName);
+      await tmpFile.rename(fileName);
     } finally {
-      await sink.close();
+      // Unconditional, and after a successful rename it finds nothing:
+      // the temp no longer exists under that name. The scratch file is
+      // never a recovery artifact — no consumer knows to look for it —
+      // so leaving one behind on the failure path would only be debris
+      // for the next attach to truncate. See [_deleteAttachTemp] for why
+      // its own failure is reported instead of raised.
+      await _deleteAttachTemp(tmpFile);
     }
   }
 

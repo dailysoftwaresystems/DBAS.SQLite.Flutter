@@ -38,6 +38,45 @@ import 'package:dbas_sqlite/src/exceptions/dbas_sqlite_exception.dart';
 /// Closing the statement closes any active reader. Closing the owning
 /// [DbasSqlite] auto-closes every still-open statement.
 class DbasSqliteStatement {
+  /// Test-only rendezvous inside `executeReader`'s prepare window —
+  /// after the pool reader and the native statement handle have been
+  /// acquired, but before ownership is transferred to the
+  /// [DbasSqliteReader] that `_activeReader` points at. `null` in
+  /// production; the awaited call is the only cost when it is set.
+  ///
+  /// Exists because that window is the one stretch of `executeReader`
+  /// no other seam can observe: the read is already holding native
+  /// resources, yet `_activeReader` is still `null`, so [close] — and
+  /// therefore `closeDb`'s statement sweep — sees nothing to await.
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static,
+  /// so a leaked hook would park every later test's first read.
+  @visibleForTesting
+  static Future<void> Function()? debugBeforeReaderTransfer;
+
+  /// Test-only rendezvous inside [executeScalar]'s one-row window —
+  /// after `executeReader` has handed back an OPEN reader and before the
+  /// single [DbasSqliteReader.readRow] that reads it. `null` in
+  /// production; the awaited call is the only cost when it is set.
+  ///
+  /// Exists because that window is the one stretch of [executeScalar]
+  /// nothing else can observe, and it is the window [executeScalar]'s
+  /// contract is about: a reader closed there makes the `readRow` throw
+  /// [DbasSqliteErrorCode.readerClosedDuringScan] instead of reporting
+  /// the `null` that means "no rows" — the one place in this release
+  /// where a throw replaces a value a caller may have been branching on.
+  ///
+  /// A seam is the only way to reach it. Every step from the reader's
+  /// construction to the `readRow` dispatch is pure Dart, so the window
+  /// is microtasks wide: another async flow is scheduled either wholly
+  /// before it or wholly after it, and `closeDb`'s sweep in particular
+  /// always loses (its drain costs strictly more hops — the ordering is
+  /// pinned by its own test).
+  ///
+  /// Reset it to `null` in a `finally` / `addTearDown`; it is static, so
+  /// a leaked hook would run inside every later `executeScalar`.
+  @visibleForTesting
+  static Future<void> Function()? debugBeforeScalarReadRow;
+
   final DbasSqlite _db;
   final DbasSqlitePlatform _platform;
   final String _sql;
@@ -47,6 +86,7 @@ class DbasSqliteStatement {
 
   DbasSqliteReader? _activeReader;
   bool _closed = false;
+  Future<void>? _closeFuture;
   int _lastAffectedRows = -1;
   int _lastInsertedId = -1;
   String? _lastError;
@@ -79,16 +119,46 @@ class DbasSqliteStatement {
   /// WAL pool read doesn't touch the writer connection) and whenever no
   /// reader is open on this statement.
   ///
-  /// Internal seam for [DbasSqlite.commit]'s pre-flight check. Safe for
-  /// it to reach this only through `_activeStatements`: a statement is
-  /// removed from that set exactly once, on the last line of [close],
-  /// and [close] first awaits `reader.close()` — which flips the
-  /// reader's `isClosed` synchronously — so this getter is already
-  /// `false` before the statement can leave the set.
+  /// Internal seam for [DbasSqlite.commit]'s pre-flight check.
+  ///
+  /// **Load-bearing: "open" here has to mean DRAIN-COMPLETE, not
+  /// close-started**, and the SLOT is what says so. This getter must not
+  /// consult any flag that flips when a close *starts*.
+  ///
+  /// It previously read [DbasSqliteReader.isClosed], justified by the
+  /// observation that a statement leaves `_activeStatements` only on the
+  /// last line of [close], and [close] first awaits `reader.close()` —
+  /// which flips `isClosed` synchronously — "so this getter is already
+  /// `false` before the statement can leave the set". That argument is
+  /// sound and it proves the wrong thing: what it establishes is that the
+  /// getter goes `false` EARLY. For a predicate whose `false` authorises
+  /// `COMMIT`, and the `_releaseWriterLock()` after it that hands the
+  /// writer to the next FIFO waiter to prepare, bind, step and finalize
+  /// on, early is precisely the failure — the one the refusal's own
+  /// message describes. Late is survivable: a caller that gets
+  /// [DbasSqliteErrorCode.commitBlockedByActiveReader] closes its reader
+  /// and commits again, with nothing disturbed.
+  ///
+  /// `_activeReader` itself carries the drain-complete fact and needs no
+  /// help doing it. It is cleared in ONE place — the identity-guarded
+  /// clear at the end of the `onClose` closure in [executeReader] — which
+  /// runs after that closure has read its counters, finalized the
+  /// `sqlite3_stmt` and released the connection, and which the reader's
+  /// own `_doClose` reaches only after its in-flight `sqlite3_step`s have
+  /// drained. So the slot goes empty exactly when native code is finished
+  /// with this reader, never before.
+  ///
+  /// A second flag on the reader (`isFullyClosedInternal`, set at the end
+  /// of `_doClose`) was added here and has been **removed**: it could only
+  /// ever lag that clear, never lead it, so no reachable state
+  /// distinguished the two forms — `_activeReader != null &&
+  /// _activeReader!.isFullyClosedInternal` is unreachable by
+  /// construction. Three separate mutations of it left the whole suite
+  /// green while the two writer-reader tests still killed a revert to
+  /// `isClosed`, which is the shape of a mechanism that is advertised as
+  /// live and is inert.
   bool get hasOpenWriterReaderInternal =>
-      _activeReader != null &&
-      !_activeReader!.isClosed &&
-      _activeReaderUsesWriter;
+      _activeReader != null && _activeReaderUsesWriter;
 
   // ── Bindings (positional, fluent) ────────────────────────────────────
 
@@ -290,6 +360,13 @@ class DbasSqliteStatement {
     // autocommit mode and survive the rollback silently. See
     // [DbasSqlite.rollback]. Both calls run in this same synchronous
     // turn, so no other flow can observe an untracked registration.
+    //
+    // The native-operation registration joins that same synchronous
+    // turn. It is deliberately NOT taken around the writer-lock acquire
+    // above: a caller merely parked on the Dart-side FIFO queue has not
+    // reached native code, and `closeDb` rejects it through
+    // `_cancelWriterWaitQueue` rather than waiting for it.
+    final nativeOp = _db.beginNativeOpInternal(_nativeOpLabel('executeSql'));
     final dispatch = _executeSqlDispatch();
     if (reentrantOp != null) {
       _db.trackReentrantWriterOpDispatchInternal(reentrantOp, dispatch);
@@ -302,6 +379,7 @@ class DbasSqliteStatement {
       } else {
         _db.releaseWriterLockInternal();
       }
+      _db.endNativeOpInternal(nativeOp);
     }
   }
 
@@ -569,6 +647,48 @@ class DbasSqliteStatement {
   }
 
   Future<DbasSqliteReader> _executeReaderNative() async {
+    // Register with the connection-wide native-operation registry HERE:
+    // synchronously, before the first `await`, and — the load-bearing
+    // part — before the routing decision immediately below.
+    //
+    // Everything after this line acquires native resources that no other
+    // tracked owner can see until `_activeReader` is assigned near the
+    // end: a checked-out pool reader (or the writer connection) plus a
+    // live `sqlite3_stmt`. A `closeDb()` arriving while this method is
+    // suspended anywhere in that window finds `_activeReader == null`,
+    // so `close()` awaits nothing and the statement sweep disowns the
+    // statement outright — after which the POOL route deadlocks
+    // (`ClosePool` waits on a reader nobody will release) and the WRITER
+    // route corrupts memory (the writer is not checkout-tracked, so
+    // `ClosePool` force-closes it under this live handle). ONE
+    // registration above the branch is what covers both by construction;
+    // registering per-route would leave whichever route was written
+    // second silently uncovered. See [DbasSqlite.beginNativeOpInternal].
+    final nativeOp = _db.beginNativeOpInternal(_nativeOpLabel('executeReader'));
+    try {
+      return await _executeReaderRouted();
+    } finally {
+      // Un-registered LAST — after the inner `finally` has either handed
+      // ownership to `_activeReader` (which `closeDb`'s statement sweep
+      // can find and close) or unwound everything it acquired. Ending it
+      // any earlier would let teardown proceed over a pool reader that
+      // has not been returned yet.
+      _db.endNativeOpInternal(nativeOp);
+    }
+  }
+
+  /// Registry label for an in-flight native operation on this statement.
+  /// Delegates to [DbasSqlite.nativeOpLabelInternal] so this statement's
+  /// labels and `executeScript`'s are derived the same way — see there.
+  String _nativeOpLabel(String verb) =>
+      DbasSqlite.nativeOpLabelInternal(verb, _sql);
+
+  /// The connection-routing, prepare, bind and reader-handoff body of
+  /// [executeReader]. Split out of [_executeReaderNative] so the
+  /// native-operation registration can wrap it whole — including the
+  /// routing decision, which is what makes the pool and writer routes
+  /// covered by the same registration.
+  Future<DbasSqliteReader> _executeReaderRouted() async {
     // Use the writer connection only after a write has happened in the
     // current transaction (read-your-writes). Before any writes — or
     // outside a transaction — go through the pool so parallel reads
@@ -645,7 +765,19 @@ class DbasSqliteStatement {
 
       await _replayBinds(conn, handle);
 
-      final reader = DbasSqliteReader.internal(
+      // Test-only rendezvous — see [debugBeforeReaderTransfer].
+      final beforeReaderTransfer = debugBeforeReaderTransfer;
+      if (beforeReaderTransfer != null) await beforeReaderTransfer();
+
+      // Declared ahead of the constructor call, not initialised by it, so
+      // that `onClose` below can capture this scope's OWN reader for its
+      // identity check — Dart forbids an initialiser referencing the
+      // variable it initialises, even from inside a closure. The `late`
+      // cannot fail: `onClose` is invoked only from
+      // [DbasSqliteReader.close], and no caller can hold this reader to
+      // close it until the assignment below has completed.
+      late final DbasSqliteReader reader;
+      reader = DbasSqliteReader.internal(
         conn: conn,
         handle: handle,
         platform: _platform,
@@ -658,6 +790,22 @@ class DbasSqliteStatement {
           // Order is load-bearing: read counters BEFORE finalize, then
           // release. We track the first error and log subsequent ones
           // so no failure is silently dropped if multiple steps fail.
+          //
+          // Each phase reports through BOTH sinks, and each sink carries
+          // something the other cannot. `developer.log` is the only one
+          // that takes the error object and its stack — and only the
+          // FIRST failure's stack survives the rethrow at the end of
+          // this closure, so phases two and three have no other route
+          // for theirs at all. [DbasSqlite.reportDiagnosticInternal] is
+          // the only one a consumer can actually READ: `developer.log`
+          // publishes to the VM service `Logging` stream and is dropped
+          // whenever no client is subscribed, which is every release
+          // build on a device and every `flutter test` run — i.e.
+          // exactly where these failures cost something. That is the
+          // same pairing `closeDb`'s statement sweep uses, and the
+          // reason each message below names the specific resource or
+          // result that was lost: "onClose failed" is not a diagnosis.
+          // See [DbasSqlite.onDiagnostic].
           Object? firstErr;
           StackTrace? firstStack;
           try {
@@ -675,6 +823,15 @@ class DbasSqliteStatement {
               error: e,
               stackTrace: st,
             );
+            DbasSqlite.reportDiagnosticInternal(
+              'reader onClose: reading the per-statement counters failed '
+              '($e). getAffectedRows(), getLastInsertedId() and the '
+              'last-error accessors on this statement keep whatever they '
+              'were last given, and the handle is finalized immediately '
+              'below — so those values can never be obtained again for '
+              'this execution. Teardown continues.',
+              name: 'dbas_sqlite.DbasSqliteStatement',
+            );
           }
           try {
             await _platform.finalizeStmt(conn, handle);
@@ -686,6 +843,16 @@ class DbasSqliteStatement {
               name: 'dbas_sqlite.DbasSqliteStatement',
               error: e,
               stackTrace: st,
+            );
+            DbasSqlite.reportDiagnosticInternal(
+              'reader onClose: finalizing the sqlite3_stmt failed ($e). '
+              'That handle is leaked for the lifetime of the process. On '
+              'the pool path closeDb() still returns normally — ClosePool '
+              'force-closes — so this report is the only signal you get; '
+              'on the single-connection path it is what makes a later '
+              'closeDb() come back SQLITE_BUSY. The connection this '
+              'reader holds is released below regardless.',
+              name: 'dbas_sqlite.DbasSqliteStatement',
             );
           }
           try {
@@ -699,8 +866,45 @@ class DbasSqliteStatement {
               error: e,
               stackTrace: st,
             );
+            DbasSqlite.reportDiagnosticInternal(
+              'reader onClose: releasing this reader\'s connection failed '
+              '($e). What is stranded depends on how the read was routed: '
+              'a POOL reader stays checked out for the lifetime of the '
+              'process and ClosePool — which blocks until every '
+              'checked-out reader is back — makes a later closeDb() hang '
+              'with no timeout on that path; a SINGLE-CONNECTION read '
+              'leaves the writer lock held, so every later write and '
+              'every transaction parks behind it forever.',
+              name: 'dbas_sqlite.DbasSqliteStatement',
+            );
           }
-          _activeReader = null;
+          // The identity check is load-bearing: a predecessor's DELAYED
+          // cleanup must never clear a successor's claim. `close()` latches
+          // the reader's `isClosed` synchronously and only then suspends —
+          // on its step drain and again on this very closure's
+          // `finalizeStmt` / `releaseFn`, both real worker round trips —
+          // while `executeReader`'s admission guard reads exactly that
+          // flag. So a SECOND reader is legitimately admitted and
+          // published into `_activeReader` before this runs, and clearing
+          // unconditionally would erase the only slot anything can reach
+          // it through: `closeDb`'s statement sweep would find `null`,
+          // close nothing, and `_activeStatements.clear()` would disown
+          // the statement — after which the POOL route deadlocks
+          // (`ClosePool` waits on a reader nobody will release) and the
+          // WRITER route lets `commit()`'s pre-flight see a quiescent
+          // writer and commit out from under a live cursor. Admitting the
+          // successor is correct — serialising close-then-requery instead
+          // was considered and rejected — so the fix belongs here.
+          //
+          // Both fields clear together, under the one check, for the
+          // reason [_activeReaderUsesWriter] documents: the pair can never
+          // be allowed to disagree. Guarding only `_activeReader` would
+          // leave `hasOpenWriterReaderInternal` reporting `false` for a
+          // live writer-bound successor.
+          if (identical(_activeReader, reader)) {
+            _activeReader = null;
+            _activeReaderUsesWriter = false;
+          }
           if (firstErr != null) {
             Error.throwWithStackTrace(firstErr, firstStack!);
           }
@@ -762,6 +966,17 @@ class DbasSqliteStatement {
   /// typed by the column's SQLite type: `int` for INTEGER, `double`
   /// for FLOAT, `String` for TEXT, [Uint8List] for BLOB.
   ///
+  /// **`null` means "no row / SQL NULL", and nothing else.** This method
+  /// runs one [DbasSqliteReader.readRow], so it inherits that method's
+  /// teardown contract: if the reader is torn down between
+  /// [executeReader] returning and that first `readRow` — a
+  /// [DbasSqlite.closeDb] statement sweep, or a [close] on this
+  /// statement from elsewhere — the `readRow` throws
+  /// [DbasSqliteErrorCode.readerClosedDuringScan] and this method
+  /// throws it on, instead of reporting the empty result `null` would
+  /// claim. Before 2.9.0 that case returned `null`, indistinguishable
+  /// from a genuinely empty query.
+  ///
   /// Closes both the underlying reader and this statement before
   /// returning, so the statement is single-use — calling any execute
   /// method on it afterwards throws a [DbasSqliteException] with code
@@ -775,6 +990,10 @@ class DbasSqliteStatement {
       nameParams: nameParams,
     );
     try {
+      // Test-only rendezvous — see [debugBeforeScalarReadRow]. Inside the
+      // `try` so a hook that throws still runs the cleanup below.
+      final beforeReadRow = debugBeforeScalarReadRow;
+      if (beforeReadRow != null) await beforeReadRow();
       if (!await reader.readRow()) return null;
       return reader.getColumnValue(0);
     } finally {
@@ -828,15 +1047,48 @@ class DbasSqliteStatement {
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   /// Closes any active reader, clears the bind buffers, and marks the
-  /// statement closed. Idempotent. Subsequent execute calls throw a
+  /// statement closed. Subsequent execute calls throw a
   /// [DbasSqliteException] with code [DbasSqliteErrorCode.statementClosed].
-  Future<void> close() async {
-    if (_closed) return;
+  ///
+  /// **Join-idempotent**, exactly like [DbasSqliteReader.close]: concurrent
+  /// callers all observe the same completion future, so a second caller
+  /// waits for the first call's cleanup to finish rather than returning
+  /// instantly while resources are still mid-tear-down.
+  ///
+  /// That distinction is load-bearing for `closeDb`'s statement sweep,
+  /// which is the second caller in the shape this exists for
+  /// (`unawaited(stmt.close())` then `closeDb()` — logout while a list
+  /// view is mid-scan). `_closed` is latched SYNCHRONOUSLY here and the
+  /// reader below then suspends — on its step drain and again on
+  /// `onClose`, whose `finalizeStmt` is a real worker dispatch — so a
+  /// returning-early second caller would walk on while this statement's
+  /// reader still holds a checked-out pool connection and a live
+  /// `sqlite3_stmt`. The sweep would then `_activeStatements.clear()` it
+  /// away, nothing would release the pool reader, and `ClosePool` — which
+  /// blocks until every checked-out reader is back — would wait forever.
+  Future<void> close() => _closeFuture ??= _doClose(teardown: false);
+
+  /// [close] for `closeDb`'s statement sweep, which is the one caller
+  /// that may truthfully describe itself as teardown — it is passed
+  /// through to the reader so that a `readerClosedDuringScan` raised
+  /// afterwards can say the database closed under the scan instead of
+  /// guessing between that and a deliberate `close()`. Identical to
+  /// [close] in every other respect, join-idempotency included.
+  Future<void> closeForTeardownInternal() =>
+      _closeFuture ??= _doClose(teardown: true);
+
+  Future<void> _doClose({required bool teardown}) async {
     _closed = true;
     final reader = _activeReader;
-    if (reader != null && !reader.isClosed) {
+    // No `!reader.isClosed` condition: [DbasSqliteReader.close] is itself
+    // join-idempotent, so this is cheap on the already-closed path and —
+    // the point — it JOINS a close that is already running instead of
+    // reading its synchronously-latched `isClosed` as "nothing to do".
+    if (reader != null) {
       try {
-        await reader.close();
+        await (teardown
+            ? reader.closeForTeardownInternal()
+            : reader.close());
       } catch (e, st) {
         developer.log(
           'reader.close failed during statement close',

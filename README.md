@@ -27,11 +27,18 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
 ### Thread Safety & Parallel Readers
 - **Writer lock**: serializes all write operations (`executeSql`, transactions) on both web and native
 - **Independent readers**: each `executeReader` call returns a `DbasSqliteReader` with its own pool connection -- multiple readers can be active simultaneously
-- Pool readers are acquired non-blocking; if all are busy, the reader falls back to the writer connection
+- Pool readers are acquired through a Dart-side semaphore with a `kPoolAcquireTimeoutMs` (30 s) budget; if none frees up inside it, `executeReader` throws `executeReaderPoolAcquireTimeout` — it does **not** silently fall back to the writer. Reads route to the writer only *inside a transaction that has written* (read-your-writes), and take the writer lock only in single-connection mode, where there is no pool at all
 - Transactions hold the writer lock for their full duration
 - Reads within a transaction use the writer connection to see uncommitted data
 - Readers must be closed explicitly via `reader.close()` (or auto-closed when `readRow()` returns `false`) before the connection can be reused
-- `closeDb()` automatically closes all active readers, then releases all locks and unblocks any pending operations -- no risk of use-after-free on lingering readers
+- `closeDb()` automatically closes all active readers, rolls back any open transaction (which releases the writer lock that transaction held) and rejects every caller parked on the writer-lock and reader-slot queues -- no risk of use-after-free on lingering readers. It deliberately does **not** clear a writer-lock hold it does not own: a granted acquire is not a queue entry, and clearing it under a live holder would let a later `openDb()` hand the lock to a second owner. `openDb()` resets that flag instead, on a connection that is not open and where no holder can exist
+- Closing a reader **waits for every in-flight `readRow()` step** before finalizing the statement, so `closeDb()` can never finalize a `sqlite3_stmt` a step is still running against (the C layer neither refuses nor blocks that -- it corrupts). A consumer mid-scan when this happens keeps the row its step already produced, and its next `readRow()` throws `readerClosedDuringScan` rather than reporting a truncated list as a complete one. This wait is **unbounded** -- a timeout could only expire into the corruption it prevents -- so it is not covered by the `kNativeOpDrainTimeoutMs` ceiling below; the reader emits a stall report every `DbasSqliteReader.kStepDrainStallReportMs` (5 s) instead
+- There is a **second unbounded wait, and `closeDb()` reaches it first**: `rollback()` drains every write dispatched inside the transaction before it issues `ROLLBACK`, and `closeDb()` rolls back before it drains the native-operation registry. So a `closeDb()` livelocked behind an un-awaited in-transaction `executeSql` never reaches the drain `kNativeOpDrainTimeoutMs` bounds, and `closeDbNativeOpDrainTimeout` cannot be what surfaces it. A `.timeout()` there would *abandon* the rollback rather than cancel it, leaving a detached `ROLLBACK` free to land on a connection teardown had already moved on to destroying -- so it stays unbounded and reports every `DbasSqlite.kReentrantWriterDrainStallReportMs` (5 s) instead
+- **Wire `DbasSqlite.onDiagnostic` to receive those stall reports.** They are the only signal a wedged teardown ever produces, and the reports' other sink (`dart:developer`) is dropped whenever no VM service client is subscribed -- i.e. in every release build on a device and every `flutter test` run, which is exactly where a production hang happens. `DbasSqlite.onDiagnostic = (message) => myLogger.warn(message);` once at app start is enough. Also delivered through it: a failure in any of the three phases of a reader's teardown (counter read, `finalizeStmt`, connection release), each of which loses a different resource nothing downstream can recover or name, and a `poolReleaseReader` that threw inside `setBusyTimeout()`. Also a **`rollback()` that failed during `closeDb()`** -- teardown continues past one deliberately, which means the WAL fold two steps later runs against a connection SQLite still considers mid-transaction, folds nothing, and lets `closeDb()` return **successfully with committed frames still in the `-wal`**; `closeDb()`'s documented escape hatch ("call `rollback()` yourself first") cannot cover the post-drain attempt, because that transaction did not exist when the caller could have. The sink **must be synchronous** (`void Function(String)` accepts an `async` body, but its failure then escapes as an unhandled async error); a synchronous throw is caught rather than allowed to break the close, and the original message is re-emitted through `Zone.current.print` so a consumer whose logger died first still sees it
+- `closeDb()` is **single-flight**: a second call issued while a teardown is in flight joins it and returns with its outcome, rather than reporting success while the pool is still being destroyed. `openDb()` and `dropDb()` join that same teardown -- `isOpened()` reads `false` from the moment `_db` is nulled, which is *before* the pool is destroyed, so neither may sample it. A teardown that fails therefore surfaces its error from `openDb()` / `dropDb()` too, instead of being swallowed
+- `closeDb()` **joins a close that is already in progress** rather than skipping it. `reader.close()` / `stmt.close()` latch `isClosed` synchronously and then suspend, so an un-awaited close (`unawaited(reader.close()); await db.closeDb();`) leaves a reader that reports itself closed while it still holds a pool connection. Both closes are join-idempotent and the statement sweep waits for them
+- `closeDb()` also **waits** for any operation that has already crossed into native code, since neither the closing flag nor the wait-queue cancellations can recall one. Callers parked in Dart are still rejected immediately. In practice: closing a database with an un-awaited call still in flight takes as long as that call does. The wait is bounded by `kNativeOpDrainTimeoutMs` (30 s), after which `closeDb()` throws `closeDbNativeOpDrainTimeout` and leaves the connection **open** rather than destroying it under live native work
+- **A caught `closeDbNativeOpDrainTimeout` does not hand back a usable connection.** It stays open but stays *marked closing*: every writer-lock acquire then throws `writerLockWaitCancelled` (`executeSql` outside a transaction, `executeScript`, `beginTransaction`, `checkpoint`, `vacuum`, `enableWal`), every reader-slot acquire throws `readerSlotWaitCancelled` (pooled `executeReader`), and `setBusyTimeout` throws too. `openDb()` will **not** clear it -- the connection is still open, so `openDb` returns early on its `isOpened()` guard. Any open transaction is gone as well, since `closeDb()` rolls back as its first step. The only supported next step is to await the outstanding work and call `closeDb()` again
 
 ### Background FFI Worker (Native)
 - All heavy FFI operations (`executeSql`, `prepareQuery`, `readRow`, `openDb`, `closeDb`) run on a dedicated background isolate
@@ -39,23 +46,25 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
 - Bind operations remain synchronous on the main isolate for performance
 
 ### True Streaming I/O (Web)
-- **`attachStreamDb(stream)`**: Streams a database to OPFS chunk by chunk via `attachStreamBegin`/`attachStreamChunk`/`attachStreamEnd` with ACK-based backpressure. The complete file is never buffered in Dart memory -- critical for large databases (500 MB+)
+- **`attachStreamDb(stream)`**: Streams a database to OPFS chunk by chunk via `attachStreamBegin`/`attachStreamChunk`/`attachStreamEnd` with ACK-based backpressure. The complete file is never buffered in Dart memory -- critical for large databases (500 MB+). **Unlike the native implementation this is not atomic**: `attachStreamBegin` truncates the live database before the first chunk and an abort unlinks it, so a stream that fails partway destroys what was there. See *Database Content* below
 - **`getContent()`**: Streams the database from OPFS chunk by chunk. Supports both Transferable Streams (Chrome/Firefox) and chunked postMessage fallback (Safari)
 - **`streamCopyDb(destDbName)`**: Copies between OPFS files chunk by chunk
 
 ### Database Operations
 - **Lifecycle**
   - `getInstance(dbName:)` - Get singleton instance for a database
-  - `openDb({readerPoolSize})` - Open database with connection pool
-  - `closeDb()` - Close database connection (automatically closes all active readers, rolls back any open transaction, then folds the WAL into the main `.db` file)
-  - `isOpened()` - Check connection status
+  - `openDb({readerPoolSize})` - Open database with connection pool. Waits for a teardown already in flight before it looks at anything, its own idempotency check included
+  - `closeDb()` - Close database connection (rolls back any open transaction, waits for work already inside native code, closes all active readers, then folds the WAL into the main `.db` file)
+  - `isOpened()` - Check connection status. **Not an admission check against a close**: it reads `false` from the instant `_db` is nulled, which is before the pool is destroyed
   - `getAppDatabasePath()` - Get platform-specific database path
   - `databaseExists()` - Check if the database file exists
-  - `dropDb()` - Delete the database file (including WAL and SHM)
+  - `dropDb()` - Delete the database file (including WAL and SHM). Joins an in-flight `closeDb()` first, so it cannot unlink files the C pool is still holding open. **Not atomic against a caller that reopens the database concurrently** -- arbitrating that needs an admission gate over `openDb()` this library does not have, so it is a caller-side ordering error `dropDb()` cannot see
 
 - **Database Content**
   - `attachDb(bytes)` - Attach a database from raw bytes
   - `attachStreamDb(stream)` - Attach a database from a byte stream
+  - **Attach atomicity (native):** both write a sibling temp file, flush and close it, and only then drop the destination and rename the temp onto it -- so an attach that fails partway is a **no-op** and the existing database survives. **Web is not atomic and this cannot be fixed from this package:** the prebuilt worker opens the live OPFS database with mode `w+` (truncating it before the first chunk) and unlinks that same path on abort, so a mid-stream failure **destroys** the database. That worker is a build artifact of the separate `DBAS.SQLite` repository and is tracked there. On web, keep your own copy of anything you cannot re-download
+  - **An attach REFUSES when a different live instance holds the database.** `attachDb` / `attachStreamDb` replace the file wholesale, so before they touch it they join any teardown this instance still has in flight, close this instance if it is open, and then look at who holds `dbName`'s instance slot. If that is some *other* `DbasSqlite` and it is open, opening or closing, the attach throws `DbasSqliteException` with code `attachDbInstanceSlotHeldByLiveInstance` and touches nothing -- the file, that instance's pool and the slot are exactly as they were. Replacing the file underneath it would unlink the `.db`, `-wal`, `-shm` and `-journal` out from under a live connection; closing it instead would be a destructive side effect on an object the caller does not own and cannot report to. Obtain the holder with `DbasSqlite.getInstance(dbName: ...)` and issue the attach on it, or close it first. A slot held by a *closed* instance holds no files, so the attach proceeds and leaves it in place
   - `streamCopyDb(destDbName)` - Stream-copy database to a new name (checkpoints first, so the copy is self-contained — only the main `.db` file is copied)
   - `getContent()` - Get the raw bytes of the database file
   - `checkpoint()` - Fold committed WAL frames into the main `.db` file. Returns a `DbasSqliteCheckpointResult` (`busy`, `log`, `checkpointed`, `isComplete`). Read `isComplete` (`checkpointed == log`) — `busy` is **not** a success signal: a PASSIVE checkpoint that folds nothing because a reader pins the WAL still reports `busy: 0` and `SQLITE_OK`. An incomplete fold is recoverable, not an error: the pinned frames fold at the next opportunity
@@ -75,8 +84,8 @@ Flutter plugin that provides access to SQLite databases for Android, iOS, macOS,
   - `isInTransaction` - Check if a transaction is currently active
 
 ### Data Retrieval (`DbasSqliteReader`)
-- `readRow()` - Advance to next row (`true` if available, `false` and auto-closes when done)
-- `readRows([amount = 50])` - Read up to `amount` rows in one call. Returns a record `({rows, hasMore})` where `rows` is `List<Map<String, ColumnData>>` (column name → typed `ColumnData`) and `hasMore` is the result of the last `readRow` (`true` = more rows may follow, `false` = result set exhausted)
+- `readRow()` - Advance to next row (`true` if available, `false` and auto-closes when done). **`false` means "no more rows" and nothing else**: a reader closed for any other reason -- an explicit `close()`, a `DbasSqliteStatement.close()`, `closeDb()`'s statement sweep, or an earlier failed step -- throws `readerClosedDuringScan` instead, so a scan cut short by teardown can never be mistaken for one that ran out of rows
+- `readRows([amount = 50])` - Read up to `amount` rows in one call. Returns a record `({rows, hasMore})` where `rows` is `List<Map<String, ColumnData>>` (column name → typed `ColumnData`) and `hasMore` is the result of the last `readRow` (`true` = more rows may follow, `false` = result set exhausted). It is a plain loop over `readRow()`, so it inherits the throw above: a batch cut short by a close raises `readerClosedDuringScan` and **the rows gathered so far are discarded**, rather than being reported as a completed batch. It never drops a row either: a step that reports a row the cache cannot snapshot raises `readRowFailed` instead of skipping it and returning the list short (defensive -- no producer currently emits that state)
 - `close()` - Manually close the reader and release its connection
 - **Column Access** (with nullable variants)
   - `getColumnText(index)` / `getColumnNullableText(index)` - Get string value
@@ -103,7 +112,7 @@ Add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  dbas_sqlite: ^2.8.4
+  dbas_sqlite: ^2.9.0
 ```
 
 Or install with the Dart CLI:
@@ -484,6 +493,16 @@ without rethrowing.
 instance is a no-op. Calling it with a different `readerPoolSize`
 than the original throws `DbasSqliteException` with code
 `openDbReopenWithDifferentPoolSize`.
+
+`openDb()` also **joins a `closeDb()` that is still in flight**, before
+its own idempotency check — an open that raced a teardown used to call
+`createPool` on a file whose previous pool was mid-destruction. One
+consequence to plan for: a teardown that **fails** now surfaces its
+error from `openDb()` rather than only from `closeDb()`. That is the
+safe reading, since the previous connection is still open and still
+marked closing, so the open could not have succeeded anyway. It does
+**not** arbitrate an open that was already past that line when the close
+started.
 
 ## Minimum Platform Versions
 

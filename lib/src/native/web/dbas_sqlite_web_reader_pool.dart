@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:web/web.dart' as web;
 
+import 'package:dbas_sqlite/src/dbas_sqlite.dart';
 import 'package:dbas_sqlite/src/dbas_sqlite_row_cache.dart';
 import 'package:dbas_sqlite/src/stub/dbas_sqlite_db_stub.dart'
     show sqliteRow, sqliteDone;
@@ -168,7 +169,24 @@ class DbasSqliteWebReaderPool implements WebLivePool {
   final int poolId = ++_idSeq;
 
   final _JsPool _pool;
+
+  /// Non-null from the instant [close] is first called, and the one close
+  /// every later caller joins. Memoized rather than re-entered, so a
+  /// duplicate [close] can never start a second worker teardown. See
+  /// [close] for why joining (rather than returning early) is the point.
+  Future<void>? _closeFuture;
+
   bool _closed = false;
+
+  /// True once [close] has been CALLED — deliberately not "once the
+  /// workers are gone".
+  ///
+  /// Its two consumers (`DbasSqliteNativeWeb._ensurePool`'s liveness
+  /// probe and `databaseExists`'s live-pool short-circuit) both need a
+  /// pool that is on its way out to read as unusable immediately, so
+  /// "started" is the correct reading THERE. It is only wrong where the
+  /// answer depends on the workers having actually gone — see
+  /// [streamFinalize], which used to make exactly that mistake.
   @override
   bool get isClosed => _closed;
 
@@ -392,7 +410,29 @@ class DbasSqliteWebReaderPool implements WebLivePool {
 
   @override
   Future<void> streamFinalize(Object cursor) async {
-    if (_closed) return; // workers gone; statements implicitly finalized
+    // Join an in-flight close rather than reading [isClosed] as "already
+    // gone". This guard used to be `if (_closed) return;` with the claim
+    // "workers gone; statements implicitly finalized" — false for the
+    // whole duration of a close, because `_closed` latches at the TOP of
+    // [close], before the worker teardown it awaits. In that window the
+    // workers are alive, the cursor is still open, and the caller was
+    // being told the finalize was complete.
+    //
+    // Joining makes the claim true by construction instead of asserting
+    // it early: when the join returns, the pool's own teardown really
+    // has reclaimed every straggler cursor — which is what the old
+    // comment described, just at the wrong moment. It matters because
+    // `DbasSqliteNativeWeb.finalizeStmt` drops its in-flight-finalize
+    // count when this future completes, and a destructive op's drain
+    // waits on that count; completing early hands the drain a false
+    // all-clear, the same "started read as finished" error this fix
+    // exists to remove.
+    //
+    // Cannot deadlock: [close] awaits only the JS pool's own teardown.
+    // Nothing on the close path awaits a Dart-side finalize, so the join
+    // is strictly one-directional.
+    final closing = _closeFuture;
+    if (closing != null) return await closing;
     try {
       await _pool.streamFinalize(cursor as JSAny).toDart;
     } catch (e) {
@@ -403,15 +443,59 @@ class DbasSqliteWebReaderPool implements WebLivePool {
     }
   }
 
+  /// Tears the pool (all workers) down. **Join-idempotent:** every caller
+  /// after the first gets the SAME future, so it returns when the workers
+  /// are actually gone rather than at the moment the close was requested.
+  ///
+  /// This replaced `if (_closed) return;`, which was the same
+  /// started-vs-finished error as [streamFinalize]'s old guard: a second
+  /// closer — `DbasSqliteNativeWeb._teardownLivePool` running on a
+  /// sibling shim instance that shares this pool object — returned while
+  /// the first close was still tearing workers down, and was then free to
+  /// `bootWebLivePool` a replacement against OPFS files the outgoing
+  /// workers had not yet released.
+  ///
+  /// The single-worker sibling ([DbasSqliteWebPool.close]) has behaved
+  /// this way since it grew its static `_closing` barrier, and documents
+  /// the same rationale; this brings the multi-worker pool in line rather
+  /// than inventing a second discipline.
   @override
-  Future<void> close() async {
-    if (_closed) return;
+  Future<void> close() => _closeFuture ??= _doClose();
+
+  Future<void> _doClose() async {
+    // Latched before this method's first suspension (an `async` body runs
+    // synchronously up to its first `await`, and [close] assigns the
+    // memo synchronously too), so a concurrent [exec] / [query] /
+    // [streamPrepare] trips [_ensureOpen] immediately instead of opening
+    // new work against workers on their way out.
     _closed = true;
     try {
       await _pool.close().toDart;
     } catch (e, st) {
+      // BOTH sinks, and the [DbasSqlite.onDiagnostic] one is what makes
+      // this reachable at all: `developer.log` is dropped whenever no VM
+      // service client is subscribed, i.e. every release build.
+      //
+      // Swallowing here is now MORE consequential than it was, because
+      // [close] memoizes this future. A failed close is never retried,
+      // and every later joiner — including
+      // `DbasSqliteNativeWeb._teardownLivePool` on a sibling shim — is
+      // handed this same completed future and resolves SUCCESSFULLY off
+      // it, asserting the very claim that failed: that the workers are
+      // gone and their OPFS files released. The next `bootWebLivePool`
+      // then races files the outgoing workers may still own. Nothing
+      // downstream can detect that, so this report is the only signal
+      // there is.
       developer.log('web reader pool close failed (id=$poolId)',
           name: 'dbas_sqlite.pool', error: e, stackTrace: st);
+      DbasSqlite.reportDiagnosticInternal(
+        'web: tearing down reader pool $poolId failed ($e). The close is '
+        'MEMOIZED, so it is never retried and every later caller joins this '
+        'failed attempt and is told the pool closed cleanly. Its workers may '
+        'still hold their OPFS files, and the next pool created for the same '
+        'database will race them.',
+        name: 'dbas_sqlite.pool',
+      );
     }
   }
 }
